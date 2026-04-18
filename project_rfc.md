@@ -63,15 +63,9 @@ Origin Server                                 Destination Server
       |                                                 |
       |<------------------------------------------------|
       |                 202 Accepted                    |
-      |                                                 |
-      |  3. (optional) GET {attachment_pull}            |
-      |<------------------------------------------------|
-      |                                                 |
-      |------------------------------------------------>|
-      |           attachment bytes                      |
 ```
 
-Steps 1 and 3 are cacheable. Step 2 is the normative transfer event.
+Step 1 is cacheable. Step 2 is the normative transfer event. All message data — including attachment bytes — is carried inside the envelope in step 2; there is no separate fetch step.
 
 ## 4. Peer discovery
 
@@ -153,7 +147,6 @@ Envelopes are JSON objects transferred with `Content-Type: application/json; cha
       "mime_type": "application/pdf",
       "file_size": 138241,
       "hash_sha256": "base64(...)",
-      "transfer": "inline",
       "data": "base64(...)"
     }
   ],
@@ -172,8 +165,7 @@ Envelopes are JSON objects transferred with `Content-Type: application/json; cha
 - `recipients` **MUST** contain only addresses whose domain is the Destination's domain. Origin Servers **MUST** split fan-out by destination domain and send one envelope per Destination.
 - Timestamps **MUST** be RFC 3339 / ISO 8601 UTC with a trailing `Z`.
 - `thread.in_reply_to`, if present, **MUST** be a `thread.federation_id` previously seen by both Servers.
-- `attachments[].transfer` **MUST** be either `"inline"` (payload inline as base64 in `data`) or `"pull"` (payload must be fetched by the Destination, see §7).
-- An envelope **MUST NOT** mix `inline` and `pull` transfer modes: if any attachment uses `pull`, all attachments in the envelope **MUST** use `pull`.
+- Every attachment's payload **MUST** be carried inline in `data` as base64 (see §7). Out-of-band or deferred attachment transfer is not supported.
 
 ### 5.4 Idempotency
 
@@ -248,26 +240,16 @@ On accepting an envelope the Destination **MUST**:
 
 ## 7. Attachment transfer
 
-### 7.1 Inline mode
+All attachment bytes **MUST** be carried inline in the envelope as base64 in `data`. After a Destination accepts an envelope, it holds a complete, self-contained copy of every attachment; no subsequent request to the Origin is ever required to read an attachment. This guarantees that a message, once accepted, remains readable even if the Origin Server is permanently decommissioned.
 
-When `transfer = "inline"`, `data` carries the full payload as base64. The Origin **MUST** set `file_size` to the decoded byte length and `hash_sha256` to the SHA-256 of the decoded bytes. The Destination **MUST** verify both.
+Requirements:
 
-Inline mode **SHOULD** be used only when `file_size` is below the Destination's `max_attachment_bytes` minus envelope overhead.
+- The Origin **MUST** set `file_size` to the decoded byte length of `data` and `hash_sha256` to the SHA-256 of the decoded bytes.
+- The Destination **MUST** recompute both values on receipt and reject the envelope with `400 Bad Request` (`error = "attachment_mismatch"`) if either differs.
+- An Origin **MUST NOT** send an envelope whose serialized size exceeds the Destination's advertised `max_envelope_bytes`, nor an individual attachment exceeding `max_attachment_bytes`. A Destination receiving such an envelope **MUST** respond `413 Payload Too Large`.
+- An Origin that needs to send an attachment larger than any Destination will accept **MUST** surface a permanent failure to the sender; this protocol does not define a fallback out-of-band transfer.
 
-### 7.2 Pull mode
-
-When `transfer = "pull"`, `data` **MUST** be omitted. The Destination, after accepting the envelope, **MAY** fetch each attachment via:
-
-```
-GET {origin.backend}/api/v1/federation/attachment/{attachments[i].federation_id}
-X-Federation-Sender:    {destination_domain}
-X-Federation-Signature: ed25519:{base64(sign(path || "\n" || nonce))}
-X-Federation-Nonce:     {unique}
-```
-
-The Origin **MUST** authenticate the request symmetrically (same Ed25519 scheme, roles swapped) and **MUST** serve the raw bytes with the correct `Content-Type` and a `Content-Length` matching the advertised `file_size`. The Destination **MUST** verify the SHA-256 hash before exposing the attachment to the recipient.
-
-Attachments in pull mode **MUST** remain fetchable by the Destination for at least 30 days after the envelope was accepted.
+This design trades bandwidth and envelope size against simplicity, durability, and the "all data local to every server" invariant. That tradeoff is deliberate and **MUST NOT** be relaxed by extensions that introduce deferred, external, or pull-based attachment fetching.
 
 ## 8. Security considerations
 

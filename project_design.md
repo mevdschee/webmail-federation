@@ -314,6 +314,109 @@ After the exchange in §10–§11, the state on each side is:
 
 The federated identifiers `T`, `M1`, `M2` are identical across both databases; the autoincrement local ids are not. This is what makes reply correlation and idempotent re-delivery possible.
 
+### 13. Hosting multiple domains on one server
+
+Nothing in the wire protocol requires that one domain equal one server. A single Webmail backend deployment **MAY** be authoritative for several domains at once (e.g. one operator runs `103mail.com`, `example.com`, and `acme.io` on the same host and database). The federation RFC still sees each domain as a distinct logical Server; the physical process just serves several of them.
+
+#### 13.1 What changes in tenant config
+
+The single-valued `tenant.local_domain` from §3 becomes a set. `config/tenant.php` (or the equivalent env-backed loader) now returns:
+
+```
+local_domains: [
+  {
+    "domain":          "103mail.com",
+    "hostname":        "mail.103mail.com",
+    "api_hostname":    "api.103mail.com",
+    "brand":           { "name": "103mail",  "logo": "/103mail.svg",
+                         "marketing_url": "https://103mail.com" },
+    "federation_private_key": "ed25519:...",
+    "federation_public_key":  "ed25519:...",
+  },
+  {
+    "domain":          "example.com",
+    "hostname":        "mail.example.com",
+    "api_hostname":    "api.example.com",
+    "brand":           { "name": "Example Mail", "logo": "/example.svg",
+                         "marketing_url": "https://example.com" },
+    "federation_private_key": "ed25519:...",
+    "federation_public_key":  "ed25519:...",
+  }
+]
+```
+
+Each domain has its **own** federation keypair — never shared, because remote peers pin keys per domain (§5). Compromise of one hosted domain's key must not let an attacker impersonate the others.
+
+#### 13.2 Request routing: the Host header selects the tenant
+
+Because the browser always knows the user as "the person at `mail.example.com`", the backend picks the active domain from the incoming HTTP `Host` header:
+
+- `GET https://mail.103mail.com/config.json` → 103mail's brand block.
+- `GET https://mail.example.com/config.json` → example.com's brand block.
+- `POST https://api.103mail.com/api/v1/email/thread/...` → operates inside the 103mail tenant.
+- `POST https://api.example.com/api/v1/email/thread/...` → operates inside the example.com tenant.
+
+A lightweight middleware at the top of request handling resolves `Host` → one entry in `local_domains`, stores it in request state as `$activeTenant`, and rejects (404) any hostname not in the config. Every downstream call that used to reach for a singleton default domain now takes `$activeTenant` instead.
+
+#### 13.3 Each hosted domain gets its own well-known endpoint
+
+The same backend process serves:
+
+- `https://103mail.com/.well-known/webmail-federation` → `{domain: "103mail.com", public_key: "ed25519:K_103", ...}`
+- `https://example.com/.well-known/webmail-federation` → `{domain: "example.com", public_key: "ed25519:K_ex", ...}`
+
+Selection is again `Host`-based. Peer servers never learn that these two domains share a process.
+
+#### 13.4 User and mailbox identity stays domain-local
+
+- A `customer` and a `user` row belong to exactly one hosted domain. The association is recorded as `user.domain_id` (new column) — there is no "customer that spans domains". A person who wants accounts on both `103mail.com` and `example.com` has two `user` rows and two `customer` rows.
+- Aliases are already keyed by unique `email`; `alice@103mail.com` and `alice@example.com` coexist without schema change.
+- Login is scoped by the active tenant: the same local-part (`alice`) can log into `mail.103mail.com` and `mail.example.com` and reach different mailboxes. Bearer tokens are issued with the domain embedded, and rejected if used against a different tenant.
+
+#### 13.5 Auto-onboarding uses the recipient's domain, not a global default
+
+Today `addCustomer` creates a random `{7digit}@{default_domain}` alias. Under multi-domain hosting, it derives the alias domain from the recipient's email:
+
+```
+email       = "foo@example.com"
+domain      = "example.com"
+# Is this domain hosted here?
+if domain in local_domains:
+    alias_local_part = random_int(1000000, 9999999)
+    alias            = f"{alias_local_part}@{domain}"
+    create customer + user + mailbox + folder + alias
+    # user.domain_id = id of example.com row
+else:
+    # Not local — federation branch (§4), no onboarding.
+```
+
+The random-local-part trick for privacy is preserved; only the domain suffix is now dynamic.
+
+#### 13.6 Delivery between two locally hosted domains short-circuits federation
+
+When Alice at `103mail.com` sends to Bob at `example.com` **and both are hosted by the same backend**, the fan-out loop in §4 takes the local branch for both recipients. No envelope is built, no HTTP is emitted, no signature is computed, no `federation_delivery` row is written. The exchange is a pure in-process database operation — exactly as it would be for two users on the same domain.
+
+That property follows from the fan-out rule in §4 unchanged: membership in `local_domains` is the only test. A future operator who splits `example.com` onto its own separate backend flips one row (`domain.is_local = false`, `domain.backend_url = "https://api.example.com"`), and from that point the same send automatically uses federation instead. The sending code path is identical either way; only the branch taken at dispatch time differs.
+
+#### 13.7 Notifications pick the right branded host
+
+The `sent_email` template's base URL now resolves from the **recipient's** domain config, not from a single tenant default. A notification destined for `bob@example.com` points at `https://mail.example.com/...`, and one destined for `alice@103mail.com` points at `https://mail.103mail.com/...` — even when both are generated by the same backend in the same request.
+
+#### 13.8 What is not shared across hosted domains
+
+- **Keys** — separate Ed25519 keypair per domain (§13.1).
+- **Brand assets** — separate logo, marketing URL, display name (§2, §13.1).
+- **User accounts** — no cross-domain single sign-on (§13.4).
+- **Tokens** — issued against one tenant, rejected against others.
+
+#### 13.9 What is shared across hosted domains
+
+- **The codebase and the running process** — one PHP deployment handles N domains.
+- **The database schema and, optionally, the physical database** — `domain`, `customer`, `user`, `alias`, etc. are reused; rows are scoped by `domain_id` / `customer_id`. Operators who want stricter blast-radius isolation can still deploy one database per hosted domain without any code change; the tenant loader just points each `Host` at a different DSN.
+- **The outbound federation worker and the inbound federation endpoint** — they simply loop over `local_domains` when signing outbound envelopes (using each envelope's `origin_domain` to pick the right key) and accept inbound traffic for any hosted domain.
+
+The federation protocol does not change. The operator gains a deployment choice: N domains on one process for low-volume / small tenants, or one domain per process for isolation, performance, or compliance — with the same code, same schema, same wire format.
+
 ---
 
 ## Migration steps, in order
@@ -331,6 +434,5 @@ The federated identifiers `T`, `M1`, `M2` are identical across both databases; t
 ## Open questions
 
 - **Reply threading across domains**: `g_thread.id` is a local autoincrement. Need a federated stable ID — propose `g_thread.federation_id` (UUID, generated on origin, carried in envelope, matched on inbound replies).
-- **Attachments**: inline base64 is fine for small; for large, consider a pull model (`GET /api/v1/federation/attachment/{fedId}` on origin, signed) to avoid buffering both sides.
 - **Account portability**: if `user@example.com` wants to move to `acme.io`, do we keep the old address forwarding? Out of scope for v1 — document as "no".
 - **Spam / abuse**: TOFU pubkey pinning trusts any domain that has DNS. Add a tenant-level knob (`federation.accept_from: any | allowlist`) for private deployments.
