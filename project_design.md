@@ -138,6 +138,182 @@ When `addCustomer` runs for a remote recipient today, it creates a local mailbox
 
 The `POST /thread/{folderId}` payload is unchanged — `subscribers` is still a list of emails. Federation is invisible to the UI. The only client change is the tenant-config extraction in §2.
 
+### 10. Walkthrough: sending a cross-domain message
+
+Alice (`1234567@103mail.com`) composes a message to Bob (`bob@example.com`). Both domains are served by separate Webmail backends. The sequence:
+
+**Step A — client → origin backend.** Alice's browser posts the usual compose payload to her own backend:
+
+```
+POST https://api.103mail.com/api/v1/email/thread/{folderId}
+Authorization: Bearer {alice's token}
+
+{
+  "subscribers": ["bob@example.com"],
+  "subject":     "Hello from 103mail",
+  "body":        "Hi Bob — ...",
+  "attachments": []
+}
+```
+
+The client has no knowledge that `example.com` is remote. Federation is entirely a backend concern.
+
+**Step B — origin backend writes locally, once.** `EmailClient::addThread` on the 103mail backend writes (exactly as today):
+
+- `g_thread` — with a new `federation_id = uuidv7()` added by this design.
+- `g_message` — with its own `federation_id = uuidv7()`, `sender_email = 1234567@103mail.com`.
+- Alice's per-user rows: `thread` (in her Sent folder) and `message` (marked read).
+
+This guarantees Alice sees her Sent copy even if example.com is unreachable.
+
+**Step C — origin backend splits fan-out.** `addMessageToSubscribers` iterates `["bob@example.com"]`:
+
+- parses domain → `example.com`.
+- looks up the `domain` row: not marked `is_local`.
+- delegates to the outbound federation branch.
+
+No local mailbox is created for Bob (§8). A `contact` row for Bob is upserted for autocomplete only.
+
+**Step D — origin backend discovers example.com (first time only).** If `domain.last_seen_at` is stale or missing:
+
+```
+GET https://example.com/.well-known/webmail-federation
+```
+
+The returned `public_key` is pinned into the `domain` row on TOFU (§5). Cached for 24h.
+
+**Step E — origin backend enqueues the envelope.** A row is inserted into `federation_delivery`:
+
+```
+(id, g_message_id, peer_domain = "example.com",
+ status = "pending", attempts = 0, next_retry_at = NOW())
+```
+
+The actual HTTP call is done by a background worker, so Alice's compose HTTP request returns immediately (the message is already in her Sent folder; federation is async).
+
+**Step F — worker signs and posts the envelope.** The worker picks up the pending row and sends:
+
+```
+POST https://api.example.com/api/v1/federation/inbound
+X-Federation-Version:   0.1
+X-Federation-Sender:    103mail.com
+X-Federation-Nonce:     {uuidv7}
+X-Federation-Signature: ed25519(body || "\n" || nonce)
+
+{
+  "version":       "0.1",
+  "envelope_id":   "{uuidv7}",
+  "origin_domain": "103mail.com",
+  "origin_sent_at":"2026-04-18T10:15:00Z",
+  "thread":  { "federation_id": "{g_thread.federation_id}",
+               "subject":       "Hello from 103mail",
+               "in_reply_to":   null },
+  "message": { "federation_id": "{g_message.federation_id}",
+               "sender_email":  "1234567@103mail.com",
+               "sender_name":   "Alice",
+               "body":          "Hi Bob — ...",
+               "body_html":     "<p>Hi Bob — ...</p>",
+               "sent_at":       "2026-04-18T10:15:00Z" },
+  "attachments": [],
+  "recipients":  ["bob@example.com"]
+}
+```
+
+On `202 Accepted`, `federation_delivery.status` flips to `delivered`. On transient failure (5xx, 429), the retry clock starts (30s → 1h with jitter, 48h budget). On permanent failure (4xx), a local bounce message is inserted into Alice's inbox.
+
+**Step G — destination backend verifies and delivers.** The example.com backend:
+
+1. Verifies the Ed25519 signature against its cached pubkey for `103mail.com`.
+2. Checks `envelope.origin_domain == X-Federation-Sender == domain-of(sender_email)`.
+3. Dedupes on `(origin_domain, envelope_id)`.
+4. Writes local `g_thread` / `g_message` rows, carrying over the `federation_id` values so replies can correlate.
+5. Calls the **local** branch of `addMessageToSubscribers` for `bob@example.com`: if Bob has no account, the existing auto-onboarding creates `customer` + `user` + `mailbox` + `folder` + `alias` — but now with an `@example.com` alias, because this backend's tenant config says its local domain is `example.com`.
+6. Inserts Bob's per-user `thread` / `message`, unread.
+7. Enqueues a `sent_email` notification linking to `https://mail.example.com/...` — **Bob's home backend**, not Alice's.
+
+Bob receives the notification email, clicks the link, logs into his example.com mailbox, and reads the message. 103mail.com never touches Bob's credentials or mailbox contents.
+
+### 11. Walkthrough: replying across domains
+
+Bob opens the thread and hits Reply. The reply travels back along the same rails, mirrored.
+
+**Step A — Bob's client → example.com backend.** The client posts a reply to example.com's backend:
+
+```
+POST https://api.example.com/api/v1/email/message/{threadId}
+Authorization: Bearer {bob's token}
+
+{ "body": "Thanks Alice — ...", "attachments": [] }
+```
+
+`{threadId}` here is Bob's **local** per-user `thread.id` on example.com (an autoincrement). The frontend doesn't see federation ids.
+
+**Step B — example.com backend writes locally.** `EmailClient::addMessage` appends a new `g_message` to the **same** `g_thread` Bob received in §10 Step G. Because that `g_thread` has a `federation_id` stored from inbound delivery, example.com knows this thread is federated. The new `g_message` gets its own fresh `federation_id`.
+
+Bob's per-user Sent copy is written, unread-for-others.
+
+**Step C — example.com backend walks the subscriber list.** The `g_thread` has subscribers `{Alice, Bob}`. Iterating:
+
+- `bob@example.com` → local, no network.
+- `1234567@103mail.com` → domain `103mail.com`, not `is_local` on this backend → outbound federation branch.
+
+**Step D — example.com enqueues and posts to 103mail.** A `federation_delivery` row is inserted on the example.com side (the table lives on whichever server is the origin of a given envelope). The worker posts:
+
+```
+POST https://api.103mail.com/api/v1/federation/inbound
+X-Federation-Sender: example.com
+X-Federation-Signature: ...
+
+{
+  "version":       "0.1",
+  "envelope_id":   "{uuidv7}",
+  "origin_domain": "example.com",
+  "origin_sent_at":"2026-04-18T10:32:00Z",
+  "thread":  { "federation_id": "{same g_thread.federation_id as in §10}",
+               "subject":       "Hello from 103mail",
+               "in_reply_to":   "{§10 message.federation_id}" },
+  "message": { "federation_id": "{new uuidv7}",
+               "sender_email":  "bob@example.com",
+               "sender_name":   "Bob",
+               "body":          "Thanks Alice — ...",
+               "body_html":     "<p>Thanks Alice — ...</p>",
+               "sent_at":       "2026-04-18T10:32:00Z" },
+  "attachments": [],
+  "recipients":  ["1234567@103mail.com"]
+}
+```
+
+Two things to note:
+
+- `thread.federation_id` is **the same value** that 103mail generated when Alice first composed in §10 Step B. It was carried in the original envelope, stored on example.com's `g_thread`, and is now echoed back. This is how the reply correlates to the existing thread on both sides.
+- `thread.in_reply_to` references the specific message being replied to (§10's `g_message.federation_id`) — optional for threading but useful for quoting / UI.
+
+**Step E — 103mail backend verifies and appends.** The 103mail backend:
+
+1. Verifies signature with its cached pubkey for `example.com`.
+2. Dedupes on `(origin_domain = "example.com", envelope_id)`.
+3. Looks up `g_thread` by `federation_id`. **Found** — this is a reply to an existing thread, not a new thread. No new `g_thread` row is created.
+4. Appends a new `g_message` (with Bob's federation id) under that existing `g_thread`.
+5. Walks the thread's **local** subscribers and inserts a per-user `message` row for Alice, unread, into her existing `thread`.
+6. Enqueues a `sent_email` notification to Alice linking to `https://mail.103mail.com/...`.
+
+Alice gets notified, opens her thread, and sees Bob's reply appended under the same subject. From her UI the conversation looks local — threading, unread counts, and quoted replies all work as if example.com were just another 103mail user.
+
+### 12. What each server persists
+
+After the exchange in §10–§11, the state on each side is:
+
+| Table            | 103mail row                                  | example.com row                              |
+|------------------|----------------------------------------------|----------------------------------------------|
+| `g_thread`       | federation_id = T, subject = "Hello ..."     | federation_id = **T**, subject = "Hello ..." |
+| `g_message` (1)  | federation_id = M1, sender = Alice           | federation_id = **M1**, sender = Alice       |
+| `g_message` (2)  | federation_id = M2, sender = Bob             | federation_id = **M2**, sender = Bob         |
+| `thread`         | one row — Alice's view                       | one row — Bob's view                         |
+| `message` × 2    | Alice's Sent (M1) + Alice's Inbox (M2)       | Bob's Inbox (M1) + Bob's Sent (M2)           |
+| `federation_delivery` | one row (outbound M1 to example.com)    | one row (outbound M2 to 103mail)             |
+
+The federated identifiers `T`, `M1`, `M2` are identical across both databases; the autoincrement local ids are not. This is what makes reply correlation and idempotent re-delivery possible.
+
 ---
 
 ## Migration steps, in order
