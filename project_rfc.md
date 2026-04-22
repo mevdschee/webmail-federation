@@ -279,6 +279,10 @@ An Origin **MUST NOT** include external addresses in `recipients` when sending t
 
 An envelope whose `recipients` contain a mix of Destination-domain addresses and external addresses is valid only when the Destination is a Registrar. An Origin **MAY** always choose to split such an envelope by recipient class and send multiple envelopes.
 
+For any given external-address recipient in an outbound send, an Origin **MUST** select exactly one Registrar as the Destination for that recipient and **MUST** keep that selection stable across retries of the same envelope. An Origin **MUST NOT** fan out the same external-address recipient to multiple Registrars in parallel, nor re-select a different Registrar on a subsequent attempt for a recipient that has not yet been acknowledged, because doing so may cause two Registrars to independently onboard the same external address and produce divergent routing state. How an Origin chooses the Registrar (static configuration, ordered list, policy) is out of scope; the stability and single-destination requirements are not.
+
+An Origin that is itself a Registrar **MAY** resolve external-address recipients locally under §8.3 rather than selecting a peer Registrar as Destination. A non-Registrar Origin with no Registrar available to it cannot send external-addressed envelopes at all; such a configuration is permitted but precludes the sends in question.
+
 ### 8.3 Registrar lookup
 
 A Registrar **MUST** expose:
