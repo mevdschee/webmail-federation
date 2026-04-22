@@ -28,6 +28,9 @@ The following terms are used throughout:
 - **Destination Server** — The Server authoritative for a Remote recipient.
 - **Envelope** — The JSON document transferred between Servers for one message.
 - **Peer descriptor** — The JSON document published at a well-known URL describing a Server to other Servers.
+- **Registrar** — A Server that additionally resolves external email addresses to Federation-enabled canonicals and accepts inbound envelopes whose recipients are external, per §8.
+- **Plain Server** — A Server that is not a Registrar. This is the default role and is assumed when a peer descriptor omits the `role` field (§4.2).
+- **External address** — A mail address whose domain is neither the Destination's own domain nor a Federation-enabled domain (e.g. `alice@gmail.com`). External addresses appear only in envelopes sent to Registrars (§8.2).
 
 ## 2. Goals and non-goals
 
@@ -37,6 +40,7 @@ The following terms are used throughout:
 - Preserve the no-SMTP property: no message body is delivered to a host that is not a Webmail Server.
 - Authenticate every inter-Server request so that a Server cannot spoof messages from a third domain.
 - Be idempotent under retry; be deliverable offline by the sending Server.
+- Permit Servers that advertise the Registrar role (§8) to resolve external email addresses to Federation-enabled canonicals and route envelopes accordingly, without requiring a global registry.
 
 ### 2.2 Non-goals
 
@@ -90,6 +94,7 @@ The descriptor is a JSON object with the following members:
 | `inbound`     | string  | yes      | Absolute URL of the inbound envelope endpoint (see §6).         |
 | `public_key`  | string  | yes      | Ed25519 public key for transport signing, as `ed25519:{base64}`.|
 | `versions`    | array   | yes      | List of protocol versions the Server understands, e.g. `["0.1"]`. |
+| `role`        | string  | no       | `"plain"` (default) or `"registrar"`. Governs §8 behavior.      |
 | `max_envelope_bytes` | integer | no | Advertised upper bound on inbound envelope body size.           |
 | `max_attachment_bytes` | integer | no | Advertised upper bound on a single attachment payload.        |
 
@@ -102,6 +107,7 @@ Example:
   "inbound": "https://api.example.com/api/v1/federation/inbound",
   "public_key": "ed25519:MCowBQYDK2VwAyEA...",
   "versions": ["0.1"],
+  "role": "plain",
   "max_envelope_bytes": 10485760,
   "max_attachment_bytes": 26214400
 }
@@ -111,7 +117,7 @@ Example:
 
 A Server **MUST** cache the peer descriptor keyed by domain. A Server **MUST** store the `public_key` value observed on the first successful fetch and use that value to verify all subsequent inbound signatures from that domain (trust on first use). The cache entry **SHOULD** be refreshed no more often than once per 24 hours, and **MUST** be refreshed when signature verification fails with the cached key.
 
-A Server **MAY** expose an operator-controlled allowlist of permitted peer domains; if configured, envelopes from domains not on the allowlist **MUST** be rejected with `403 Forbidden` (see §8).
+A Server **MAY** expose an operator-controlled allowlist of permitted peer domains; if configured, envelopes from domains not on the allowlist **MUST** be rejected with `403 Forbidden` (see §9).
 
 ## 5. Envelope format
 
@@ -162,7 +168,7 @@ Envelopes are JSON objects transferred with `Content-Type: application/json; cha
 - `version` **MUST** be a version string the Destination advertises in `versions` of its peer descriptor. Otherwise the Destination **MUST** respond `400 Bad Request` with `error = "unsupported_version"`.
 - `envelope_id`, `thread.federation_id`, `message.federation_id`, and `attachments[].federation_id` **MUST** be UUIDv7 (RFC 9562) values.
 - `origin_domain` **MUST** match the domain portion of every `message.sender_email` in the envelope and **MUST** match the `X-Federation-Sender` header (§6).
-- `recipients` **MUST** contain only addresses whose domain is the Destination's domain. Origin Servers **MUST** split fan-out by destination domain and send one envelope per Destination.
+- `recipients` **MUST** contain only addresses whose domain is the Destination's domain, except when the Destination is a Registrar (§8.2). Origin Servers **MUST** split fan-out by destination domain and send one envelope per Destination.
 - Timestamps **MUST** be RFC 3339 / ISO 8601 UTC with a trailing `Z`.
 - `thread.in_reply_to`, if present, **MUST** be a `thread.federation_id` previously seen by both Servers.
 - Every attachment's payload **MUST** be carried inline in `data` as base64 (see §7). Out-of-band or deferred attachment transfer is not supported.
@@ -251,45 +257,182 @@ Requirements:
 
 This design trades bandwidth and envelope size against simplicity, durability, and the "all data local to every server" invariant. That tradeoff is deliberate and **MUST NOT** be relaxed by extensions that introduce deferred, external, or pull-based attachment fetching.
 
-## 8. Security considerations
+## 8. Registrar role extension
 
-### 8.1 Transport
+This section defines additional wire protocol that applies only to Servers advertising `role: "registrar"` in their peer descriptor (§4.2). Plain Servers are unaffected.
+
+### 8.1 Role advertisement
+
+A Server **MAY** advertise `role: "registrar"` in its peer descriptor. A Server whose descriptor omits `role`, or whose `role` is `"plain"`, **MUST NOT** be treated as a Registrar by its peers: its peers **MUST NOT** send such a Server envelopes containing external addresses (§8.2) and **MUST NOT** query it on the endpoints defined in §8.3 and §8.4.
+
+Registrar capability is declared at descriptor-refresh time only; a peer that observes a change in `role` **MUST** honor the new value from the next cache refresh onward (§4.3).
+
+### 8.2 Recipient rule relaxation
+
+Notwithstanding §5.3, when an envelope is delivered to a Server whose current peer descriptor advertises `role: "registrar"`:
+
+- `recipients` **MAY** contain external addresses, as defined in §1.
+- The Destination **MUST NOT** reject such an envelope on grounds of `recipients` domain mismatch.
+- The Destination is responsible for resolving or onboarding each external recipient. The internal model used (mapping table, onboarding state machine, claim lifecycle) is not specified by this document.
+
+An Origin **MUST NOT** include external addresses in `recipients` when sending to a Server that does not advertise `role: "registrar"`. Such an envelope, if received, **MUST** be rejected with `400 Bad Request` and `error = "not_registrar"`.
+
+An envelope whose `recipients` contain a mix of Destination-domain addresses and external addresses is valid only when the Destination is a Registrar. An Origin **MAY** always choose to split such an envelope by recipient class and send multiple envelopes.
+
+### 8.3 Registrar lookup
+
+A Registrar **MUST** expose:
+
+```
+GET {backend}/api/v1/registrar/lookup?hash={sha256_hex(lowercase(address))}
+```
+
+The `hash` query parameter is the hexadecimal SHA-256 digest of the lowercased external address being resolved. The request carries no body and requires no authentication.
+
+| Status | When                                 | Body                                                                                                 |
+|--------|--------------------------------------|------------------------------------------------------------------------------------------------------|
+| 200    | Authoritative record exists.         | `{"canonical": "...", "forward_canonical": "..." \| null, "issued_at": "...", "expires_at": "..."}`  |
+| 404    | No authoritative record.             | `{"error": "not_found"}`                                                                             |
+| 429    | Rate limit exceeded.                 | `{"error": "rate_limited", "retry_after_seconds": n}`                                                |
+
+Rules:
+
+- A Registrar **MUST** answer only from its own authoritative state. It **MUST NOT** recursively resolve through peer Registrars and serve the result as its own answer.
+- A Registrar **MUST NOT** return records whose `expires_at` is in the past.
+- A Registrar **MAY** cache lookup responses obtained from peer Registrars keyed by `(hash, responder_domain)` for use in its own routing decisions; such cached records **MUST NOT** be returned to third parties via this endpoint.
+- The caller's interpretation of a `200` response is: if `forward_canonical` is non-null, route to the Server authoritative for the domain of `forward_canonical` using the canonical as the recipient; otherwise route to the Server authoritative for the domain of `canonical`.
+
+### 8.4 Pending-shadow query
+
+A Registrar **MUST** expose:
+
+```
+GET {backend}/api/v1/registrar/pending-shadows?hash={sha256_hex(lowercase(address))}
+X-Federation-Sender:    {peer_registrar_domain}
+X-Federation-Nonce:     {unique per request}
+X-Federation-Signature: ed25519:{base64(signature)}
+```
+
+The signature is:
+
+```
+signature = Ed25519-sign(
+  private_key_of(X-Federation-Sender),
+  SHA-256( METHOD || "\n" || PATH_AND_QUERY || "\n" || X-Federation-Nonce )
+)
+```
+
+This endpoint is authenticated. The Destination **MUST** reject with `401 Unauthorized` (`error = "bad_signature"`) if the signature does not verify under the cached public key for `X-Federation-Sender`, if the sender's peer descriptor does not currently advertise `role: "registrar"`, or if the nonce has been seen within the last 10 minutes for that sender.
+
+| Status | When                                               | Body                                                                                                                                                             |
+|--------|----------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 200    | One or more pending records exist for the hash.    | `[ { "record_id": "...", "message_count": n, "oldest_sent_at": "...", "newest_sent_at": "...", "summary": [ { "federation_id": "...", "subject": "...", "sender_email": "...", "sent_at": "..." } ] } ]` |
+| 404    | No pending records.                                | `{"error": "not_found"}`                                                                                                                                         |
+| 401    | Signature or sender check failed.                  | `{"error": "bad_signature"}`                                                                                                                                     |
+| 429    | Rate limit exceeded.                               | `{"error": "rate_limited", "retry_after_seconds": n}`                                                                                                            |
+
+A "pending record" in this document denotes a Registrar-internal state holding messages for an external address that has not yet been bound to a canonical. The semantics of how such records come into existence or are subsequently consumed are out of scope; this endpoint only exposes their existence to authorized peer Registrars.
+
+### 8.5 Claim by real email
+
+A Registrar **MUST** accept:
+
+```
+POST {backend}/api/v1/federation/claim-by-real-email
+Content-Type: application/json; charset=utf-8
+X-Federation-Version:   0.1
+X-Federation-Sender:    {origin_domain}
+X-Federation-Nonce:     {unique per request}
+X-Federation-Signature: ed25519:{base64(signature)}
+
+{
+  "version":    "0.1",
+  "claim_id":   "{uuidv7}",
+  "token":      "{opaque token previously issued by the Registrar}",
+  "real_email": "{external address the claim is for}",
+  "canonical":  "{federated address of the claiming user}"
+}
+```
+
+The signature is computed over the body and nonce per §6.2. The Registrar **MUST**:
+
+1. Verify the signature under the cached public key for `X-Federation-Sender`; reject with `401` (`error = "bad_signature"`) on failure.
+2. Verify that the domain of `canonical` equals `X-Federation-Sender`; reject with `401` (`error = "bad_sender"`) on mismatch.
+3. Resolve `token` against its internal record store; reject with `400` (`error = "invalid_token"`) if the token is unknown, expired, already consumed, or bound to a different `real_email`.
+4. Deduplicate on `(X-Federation-Sender, claim_id)`; a duplicate **MUST** return the original outcome (202 or the prior error) without further side effects.
+
+On success, the Registrar binds `real_email` to `canonical`. Subsequent inbound envelopes containing `real_email` in `recipients` (§8.2) **MUST** be re-dispatched by the Registrar via ordinary inbound transfer (§6) to the Server authoritative for `canonical`'s domain, with `recipients` rewritten to `[canonical]`. The Registrar, acting as a routing layer only:
+
+- **MUST** preserve the original envelope's `origin_domain`, `message.sender_email`, `message.federation_id`, and `thread.federation_id`.
+- **MUST NOT** substitute its own identity for the Origin's in the signature path: a re-dispatched envelope is signed by the original Origin if the Registrar was the first hop, or by the Registrar's own key only when the Registrar is itself the Origin of the forwarded message.
+- **MUST** be idempotent on the re-dispatch: the recipient Destination deduplicates on `envelope_id` as usual (§5.4).
+
+| Status | When                                              | Body                                                                 |
+|--------|---------------------------------------------------|----------------------------------------------------------------------|
+| 200    | Claim accepted (new or idempotent replay).        | `{"claim_id": "...", "status": "accepted"}`                          |
+| 400    | Invalid token, malformed body, version mismatch.  | `{"error": "...", "detail": "..."}`                                  |
+| 401    | Signature or sender check failed.                 | `{"error": "bad_signature"}` or `{"error": "bad_sender"}`            |
+| 429    | Rate limit exceeded.                              | `{"error": "rate_limited", "retry_after_seconds": n}`                |
+
+### 8.6 Trust model for Registrars
+
+This protocol does not define a global Registrar directory. Each Registrar operator curates a local set of peer Registrars whose `/registrar/lookup` responses it consults and whose `/registrar/pending-shadows` queries it will answer. Peer selection is an operator configuration concern and is out of scope for this document.
+
+A Registrar that is not on a Server's peer list is, for the purposes of §8.3 – §8.5, identical to a non-Registrar Server: its lookup responses **MUST NOT** be trusted and its pending-shadow queries **MUST** be rejected on signature grounds (its key will not be pinned in §4.3).
+
+Removal of a peer from the configured set is effective immediately. A Server that has cached lookup responses originating from a removed peer **SHOULD** purge those cache entries.
+
+### 8.7 Interaction with §5.4 and §6
+
+The idempotency rules of §5.4 apply unchanged to envelopes carrying external addresses: dedupe is keyed on `(origin_domain, envelope_id)`, independent of recipient class.
+
+Re-dispatch by a Registrar (§8.5) is a new inbound transfer in its own right; the recipient Destination treats it as it would any other envelope and applies its own §5.4 deduplication. Because `envelope_id` is preserved by the Registrar, multiple re-dispatches produced by retry are collapsed at the final Destination.
+
+## 9. Security considerations
+
+### 9.1 Transport
 
 All requests defined in this document **MUST** be served over TLS 1.2 or later with certificates valid for the domain being addressed. Plaintext HTTP **MUST NOT** be used, including for the well-known endpoint.
 
-### 8.2 Authentication scope
+### 9.2 Authentication scope
 
 Signatures in Webmail-Federation authenticate **the Server**, not the end user. A recipient **MUST NOT** infer from a valid envelope signature that the message content was authored by the claimed `sender_email`; they can only infer that the `origin_domain` Server asserts so. End-user authentication is out of scope.
 
-### 8.3 Replay and clock skew
+### 9.3 Replay and clock skew
 
-The `X-Federation-Nonce` and timestamp constraints in §6.2 exist to limit replay windows. Destinations **MUST** keep nonce state for at least 10 minutes per origin domain.
+The `X-Federation-Nonce` and timestamp constraints in §6.2 exist to limit replay windows. Destinations **MUST** keep nonce state for at least 10 minutes per origin domain. The same nonce and replay defenses apply to §8.4 and §8.5 requests.
 
-### 8.4 Key rotation
+### 9.4 Key rotation
 
 A Server **MAY** rotate its Ed25519 keypair by publishing a new `public_key` in its peer descriptor. Destinations observing a signature failure **MUST** re-fetch the descriptor before giving up. During a rotation window a Server **MAY** sign with the old key while publishing the new one for up to 48 hours; after that window the old key **MUST NOT** be used.
 
-### 8.5 Peer identity and spoofing
+### 9.5 Peer identity and spoofing
 
-A Destination **MUST** reject any envelope where `envelope.origin_domain`, `message.sender_email`'s domain, and `X-Federation-Sender` do not all agree. This prevents one authenticated peer from impersonating another.
+A Destination **MUST** reject any envelope where `envelope.origin_domain`, `message.sender_email`'s domain, and `X-Federation-Sender` do not all agree. This prevents one authenticated peer from impersonating another. When a Registrar re-dispatches an envelope on behalf of a non-Registrar Origin (§8.5), the original Origin's domain remains the authoritative `origin_domain` of record; the Registrar's identity, if any, is conveyed transport-layer only.
 
-### 8.6 Abuse, rate limiting, and content
+### 9.6 Registrar trust and misbehavior
 
-This document does not specify anti-abuse rules. A Destination Server **SHOULD** apply per-peer rate limits, per-peer daily quotas, and content-based filters before accepting envelopes for delivery, and **MAY** refuse traffic from peers at its discretion using `403 Forbidden`.
+A Registrar configured as a peer can influence the routing of external-address envelopes sent through Servers that trust it, by returning crafted `/registrar/lookup` responses. Operators configuring peer Registrars **SHOULD** limit this list to entities whose operational integrity they have independent grounds to trust, and **SHOULD** monitor for evidence of misrouting (e.g. sustained mismatch between re-dispatch targets and recipients' expected domains). There is no protocol-level quorum or revocation mechanism; defense is curation and removal.
 
-### 8.7 Privacy
+### 9.7 Abuse, rate limiting, and content
+
+This document does not specify anti-abuse rules. A Destination Server **SHOULD** apply per-peer rate limits, per-peer daily quotas, and content-based filters before accepting envelopes for delivery, and **MAY** refuse traffic from peers at its discretion using `403 Forbidden`. Registrars **SHOULD** additionally rate-limit `/registrar/lookup` per source IP or per sender domain to mitigate enumeration of their internal mapping.
+
+### 9.8 Privacy
 
 The peer descriptor (§4.2) is public. Servers **MUST NOT** include user data, account counts, or internal topology in it.
 
-## 9. Versioning and evolution
+Registrar lookup responses (§8.3) reveal, for a given external-address hash, that a binding exists and to which Federation-enabled canonical. Because the lookup is keyed by a hash of the address itself, querying requires prior knowledge of the address; the endpoint does not enable enumeration of bindings. However, the mapping from an external address to a canonical may reveal that the holder of the external address is a user on a specific federated domain. Operators who consider this observable a privacy concern **MAY** decline to operate a Registrar role.
+
+## 10. Versioning and evolution
 
 A Server **MUST** reject envelopes whose `version` is not listed in its advertised `versions`. Future versions of this protocol **MAY** add optional fields; unknown fields in an otherwise valid envelope **MUST** be ignored by the Destination. Breaking changes **MUST** be expressed as a new `version` string, and both peers **MUST** negotiate the highest version they both support.
 
-## 10. IANA considerations
+## 11. IANA considerations
 
 This document requests no IANA actions. The well-known path `/.well-known/webmail-federation` is reserved for the purposes described herein and is not at present registered with IANA.
 
-## 11. References
+## 12. References
 
 - RFC 2119 — Key words for use in RFCs to Indicate Requirement Levels.
 - RFC 8174 — Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words.
