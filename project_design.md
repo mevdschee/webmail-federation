@@ -681,11 +681,14 @@ Plain tenants point at one or more registrars in `config/tenant.php`:
 
 ```
 'registrars' => [
-    ['domain' => '103mail.com', 'pinned_key' => 'ed25519:...'],
+    ['domain' => '103mail.com',     'pinned_key' => 'ed25519:...'],
+    ['domain' => 'mailhub.org',     'pinned_key' => 'ed25519:...'],
 ],
 ```
 
-Outbound federation to a registrar reuses the §6 inbound envelope unmodified; the registrar is responsible for resolving or onboarding the non-federated recipient (§15.5). If multiple registrars are configured, the first reachable wins; the sending tenant never fans out to more than one.
+**Invariant:** every federated server must be able to resolve an unknown real_email. A tenant with `role = 'registrar'` satisfies this on its own (it runs §15.5 locally). A tenant with `role = 'plain'` satisfies it by configuring at least one entry in `registrars` — boot fails fast if the list is empty. Enforcing this at config load keeps the §15.4 fan-out total: there is no "no registrar available" branch to reason about.
+
+Outbound federation to a registrar reuses the §6 inbound envelope unmodified; the registrar is responsible for resolving or onboarding the non-federated recipient (§15.5). The sending tenant never fans out to more than one registrar. The **first entry** in `registrars` is the tenant's designated auto-registration home: all unknown-recipient sends go there, so any tentative shadow created for this tenant's users lands on a single, predictable registrar. Additional entries exist only as federation-retry fallbacks if the first is unreachable after the normal retry window (§10); they never see traffic otherwise, which prevents split-brain shadows across registrars for the same sender tenant.
 
 #### 15.5 Compose — registrar
 
