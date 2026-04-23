@@ -85,6 +85,19 @@ Origin Domain                                 Destination Domain
 
 Step 1 is cacheable. Step 2 is the normative transfer event. All message data — including attachment bytes — is carried inside the envelope in step 2; there is no separate fetch step.
 
+### 3.1 Reliability model
+
+Every inter-Domain request defined by this protocol runs over HTTPS against a remote peer whose availability the Origin does not control. Implementations **MUST** treat all cross-Domain HTTP as unreliable and design for asynchronous, retried, idempotent delivery. Concretely:
+
+- **Asynchronous at the user interaction boundary.** A user-facing action (composing a message, accepting a claim) **MUST NOT** block on successful receipt by a remote peer. The Origin **MUST** durably record the user's intent locally first — typically by writing the relevant `g_*` rows and enqueueing an outbound delivery record — and return success to the user at that point. The network attempt happens after the user-facing request has already completed.
+- **At-least-once delivery.** Every outbound request **MUST** be retried on transient failure per the policy defined in §6.4 for inbound transfers, or an equivalently bounded policy for other endpoints. A recipient Domain **MUST** therefore assume it will receive duplicates of the same logical operation and **MUST** deduplicate on the protocol identifier defined for that endpoint (`envelope_id` for §6; `offer_id` / `claim_id` for §8.5; `(origin_domain, record_id)` for §16.4).
+- **Idempotent by construction.** Every mutating request carries a UUIDv7 identifier the Origin picks **before** the first attempt and reuses on every retry. A Destination that has already processed an identifier **MUST** return the same terminal response (typically `2xx`) without re-applying side effects.
+- **Bounded timeouts.** Every outbound request **MUST** carry a finite connect and read timeout. No cross-Domain call may block indefinitely, even when the peer is syntactically responsive. Implementations **SHOULD** distinguish "timed out" (transient, retry per §6.4) from "peer returned a permanent 4xx" (no retry).
+- **Permanent failure has a local consequence.** When the retry budget is exhausted or a `4xx` terminal error is received, the Origin **MUST** surface the failure to the originating user or to the relevant Server-internal state (e.g. a local bounce in the sender's mailbox per §6.4). An exhausted retry that simply disappears is not conformant.
+- **No synchronous fan-out across peers.** If a single user action would require contacting multiple remote Domains, the Origin **MUST** dispatch each destination independently and **MUST NOT** allow one peer's slowness or failure to block delivery to the others. Parallel dispatch and per-destination retry state are required, not optional.
+
+These requirements apply to every endpoint defined in this document: peer discovery (§4.1), inbound transfer (§6), and the Registrar endpoints (§8.3–§8.5). Implementations that treat any of these as synchronous best-effort RPCs are not conformant.
+
 ## 4. Peer discovery
 
 ### 4.1 Well-known endpoint

@@ -111,6 +111,18 @@ Single bundle, per-domain runtime config resolved from the hostname:
 
 ### 4. Fan-out split: local vs remote recipients
 
+**Reliability model for everything that follows.** Every cross-Server call in this design — envelope delivery (§4, §6), peer discovery (§5), shadow-offer / claim / backfill (§14.4), registrar lookup (§16.3), pending-shadows query (§16.4), claim-by-real-email (§15.7) — runs over HTTPS to a remote Server we do not control. Treat it as unreliable by default. Concretely:
+
+- **Async at the user boundary.** No compose, no reply, no claim-accept ever blocks on a remote peer's response. The flow is: (1) write local `g_*` and per-user rows, (2) return success to the user, (3) enqueue the outbound call, (4) a background worker actually makes the network attempt. Alice's browser sees `201 Created` from her own Server before any packet goes to a peer. The only thing that can make a user-visible operation fail is a local error (validation, DB write, auth) — never a peer being down.
+- **At-least-once delivery + idempotent receivers.** Every outbound mutating call carries a UUIDv7 identifier chosen before the first attempt and reused on retry. Receivers dedupe on `(origin_domain, envelope_id)` for inbound envelopes, `(origin_domain, offer_id)` for shadow-offers, `(origin_domain, claim_id)` for claims. A duplicate produces the original `2xx` response with no re-application of side effects.
+- **Queued + retried.** Every outbound call has a row in the single `federation_outbox` table (schema and rules below) with `kind`, `status`, `attempts`, `last_error`, `next_retry_at`. Envelopes, shadow-offers, claims, backfills, and `claim-by-real-email` posts all share the same queue and the same worker — `kind` discriminates the payload, not the delivery machinery. Retry is exponential with full jitter, 30s → 1h, 48h budget (matching RFC §6.4). Workers are idempotent — crashing mid-send and re-running from the queue produces the same outcome, not a duplicate.
+- **Bounded timeouts.** Every HTTP call sets a connect timeout (~5s) and a read timeout (~30s for envelopes, ~2s for registrar lookups, ~10s for well-known fetches). "Stuck" never means "waits forever" — it means "waits the budget and then fails transient." This applies especially to registrar `/lookup` (§16.3), which sits in the compose path: a 2s cap with fall-through to local auto-onboarding keeps user-visible latency predictable regardless of peer health.
+- **Permanent failure has a user-visible consequence.** Exhausting the retry budget or receiving a terminal 4xx **always** produces a local bounce in the sender's mailbox (§7 notifications), never a silent drop. "Delivered" in the sender's Sent folder means "durably enqueued locally," not "accepted by the remote peer" — but if the remote peer permanently refuses, the sender is told. Alice never has to discover a lost message by asking Bob.
+- **Fan-out is per-destination independent.** Alice sending to five external Domains produces five independent `federation_outbox` rows. One peer being slow or down has zero effect on the other four. There is no "all-or-nothing" batch; there is no global lock; there is no cross-peer ordering constraint.
+- **Reads are retried too, just more cheaply.** Discovery (`GET /.well-known/...`) and lookup (`GET /api/v1/registrar/lookup`) are naturally idempotent, so retries are free. They still respect the same timeout / fallback discipline: a failed discovery means the envelope sits in `federation_outbox` with `status = pending`, not that the send explodes.
+
+Assume the network is hostile and the peer is often unreachable. Every design choice below — idempotency keys, queue tables, TOFU caching, default-registrar fallback, claim-protocol signatures — is downstream of this assumption.
+
 `EmailClient::addMessageToSubscribers` becomes:
 
 ```
@@ -120,14 +132,57 @@ for each subscriber email:
         existing path: addCustomer-if-missing + insert thread/message rows
     else:
         resolve peer backend for `domain` (discovery, §5)
-        POST signed envelope to peer /api/v1/federation/inbound
-        record outbound attempt in a new `federation_delivery` table
-            (id, g_message_id, peer_domain, status, attempts,
-             last_error, next_retry_at)
+        enqueue outbound HTTP POST on the federation_outbox table
         background worker retries with exponential backoff
 ```
 
 Invariant: `g_thread` / `g_message` / `g_attachment` are written once locally so the sender keeps their Sent copy. Only the per-recipient `thread`/`message` insert is replaced by a network hop when the recipient is remote.
+
+**The `federation_outbox` table.** The reliability model above dictates a specific concrete shape: a single, generic table holding every outstanding cross-Server HTTP request this Server still owes to a peer. Envelopes (§6), shadow-offers (§14.4), claims (§14.4), backfill envelopes (§14.4), and `claim-by-real-email` posts (§15.7) all enqueue rows here. A single background worker drains it.
+
+```
+federation_outbox (
+  id               BIGINT       PK,
+  kind             ENUM         -- envelope | offer | claim | backfill
+                                -- | claim_by_real_email
+  method           VARCHAR      -- always "POST" in v1
+  peer_domain      VARCHAR      -- the peer DNS domain (for logging + rate-limit)
+  url              TEXT         -- full https://webmail.{peer}/... URL
+  headers          JSON         -- X-Federation-Sender / Nonce / Signature, ...
+  body             LONGBLOB     -- the exact bytes to send (signature was
+                                -- computed over this — do NOT re-serialize
+                                -- at send time)
+  idempotency_key  VARCHAR      -- envelope_id | offer_id | claim_id
+                                -- (whichever UUIDv7 identifies this request)
+  origin_domain    VARCHAR      -- which of our local_domains owns this send
+                                -- (picks the signing key)
+  related_id       BIGINT       -- FK into g_message / alias / offer / etc.
+                                -- (polymorphic via `kind`; used for
+                                -- bounce routing, UI, audit)
+  status           ENUM         -- pending | in_flight | delivered
+                                -- | permanent_failure
+  attempts         INT          -- incremented per send try
+  last_error       TEXT         -- transport / status / body of last fail
+  last_http_status INT          -- NULL until we've seen any HTTP response
+  next_retry_at    DATETIME     -- the worker wakes up on this
+  created_at       DATETIME,
+  delivered_at     DATETIME     NULLABLE,
+  UNIQUE(origin_domain, idempotency_key)
+)
+```
+
+Rules of this table:
+
+- **Write-before-send.** The row is inserted in the same DB transaction that writes the user-facing `g_*` rows or §14 / §15 state change. No row, no send attempt. This is what makes the write-locally-then-return-success flow durable: a worker crash after commit still re-sends the request on restart.
+- **Body is bytes, not a recipe.** The HTTP body is stored exactly as signed. On retry the worker re-uses the stored `body` and `headers` verbatim — never re-serialized, never re-signed. Anything else races the signature against JSON key ordering and clock-skew in nonce reuse. Corollary: the stored `body` is immutable; schema migrations to envelope shape do not rewrite old rows, they only affect new sends.
+- **Single worker, but parallel per-peer.** One worker process (or pool) claims rows where `status = 'pending' AND next_retry_at <= NOW()`, flips them to `in_flight`, does the `curl`, writes back the result. The claim query partitions by `peer_domain` so one slow peer cannot starve sends to other peers (§4 preamble: no synchronous fan-out across peers). A per-peer concurrency cap plus the `peer_domain` index keeps one misbehaving peer from eating the worker pool.
+- **Retry schedule.** `next_retry_at = now + expbackoff(attempts, base=30s, cap=1h, jitter=full)`, ceiling 48h total budget (matching RFC §6.4). On `202` or `200`: `status = 'delivered'`, `delivered_at = NOW()`. On transient (5xx / 408 / 425 / 429 / connect timeout / read timeout / TLS error): `attempts++`, reschedule. On permanent 4xx or budget-exhausted: `status = 'permanent_failure'`, and the consequence is routed by `kind` — an envelope failure generates a local bounce in the sender's mailbox, an offer failure is silently retired, a claim failure is surfaced in the claiming user's UI.
+- **Idempotency key is the protocol identifier.** `envelope_id` for envelopes, `offer_id` for shadow-offers, `claim_id` for claims, and so on — all UUIDv7 generated at enqueue time, never at send time. The `UNIQUE(origin_domain, idempotency_key)` constraint makes double-enqueue a database error, not a duplicate send.
+- **Honors `Retry-After`.** If the peer returns `429` with a `retry_after_seconds` body field or a `Retry-After` header, `next_retry_at` is set no earlier than that time for that `peer_domain`. Applies to the whole peer, not just the row, so follow-up sends to that peer also back off.
+- **Observable as-is.** The table doubles as the operational queue and the forensic log. "What is this Server currently owing to that Server?" is a single `SELECT ... WHERE peer_domain = ? AND status IN ('pending', 'in_flight')`. Delivered rows may be pruned after N days; permanent_failure rows are kept for audit and are what `sent_email`-bounce templates reference.
+- **Nothing in the user-facing code path writes HTTP directly.** Callers stage `federation_outbox` rows and return; the worker owns every outbound `curl`. This is the concrete mechanism for "async at the user boundary" — there is no branch in request-handling code that waits on a peer.
+
+Inbound requests have no analogous table. A peer's envelope hits `/api/v1/federation/inbound`, is verified and written into `g_thread` / `g_message` / per-user rows in one transaction, and the peer gets `202` before the response returns. The idempotency key on the receiver side is the incoming `envelope_id` (or `offer_id` / `claim_id`), stored in a small `federation_inbox_seen(origin_domain, kind, idempotency_key, first_seen_at)` dedupe table so replays produce the original response without re-applying side effects. That table is tiny, TTL'd per RFC §9.3 nonce-window rules, and does not need the retry machinery above.
 
 ### 5. Peer discovery + trust
 
@@ -223,10 +278,16 @@ GET https://webmail.example.com/.well-known/webmail-federation
 
 The fetch enforces TLS with a Web-PKI DV-or-better certificate valid for `webmail.example.com`; any cert failure aborts discovery (no fallback to the apex, no plaintext, no private-CA override). The returned `public_key` is pinned into the `domain` row on TOFU (§5). Cached for 24h.
 
-**Step E — origin backend enqueues the envelope.** A row is inserted into `federation_delivery`:
+**Step E — origin backend enqueues the envelope.** A row is inserted into `federation_outbox`:
 
 ```
-(id, g_message_id, peer_domain = "example.com",
+(id, kind = "envelope", peer_domain = "example.com",
+ url = "https://webmail.example.com/api/v1/federation/inbound",
+ headers = {...signed headers...},
+ body = {...signed envelope bytes...},
+ idempotency_key = envelope_id,
+ origin_domain = "103mail.com",
+ related_id = g_message.id,
  status = "pending", attempts = 0, next_retry_at = NOW())
 ```
 
@@ -260,7 +321,7 @@ X-Federation-Signature: ed25519(body || "\n" || nonce)
 }
 ```
 
-On `202 Accepted`, `federation_delivery.status` flips to `delivered`. On transient failure (5xx, 429), the retry clock starts (30s → 1h with jitter, 48h budget). On permanent failure (4xx), a local bounce message is inserted into Alice's inbox.
+On `202 Accepted`, `federation_outbox.status` flips to `delivered`. On transient failure (5xx, 429), the retry clock starts (30s → 1h with jitter, 48h budget). On permanent failure (4xx), a local bounce message is inserted into Alice's inbox.
 
 **Step G — destination backend verifies and delivers.** The example.com backend:
 
@@ -298,7 +359,7 @@ Bob's per-user Sent copy is written, unread-for-others.
 - `bob@example.com` → local, no network.
 - `1234567@103mail.com` → domain `103mail.com`, not `is_local` on this backend → outbound federation branch.
 
-**Step D — example.com enqueues and posts to 103mail.** A `federation_delivery` row is inserted on the example.com side (the table lives on whichever server is the origin of a given envelope). The worker posts:
+**Step D — example.com enqueues and posts to 103mail.** A `federation_outbox` row is inserted on the example.com side (the table lives on whichever server is the origin of a given envelope). The worker posts:
 
 ```
 POST https://webmail.103mail.com/api/v1/federation/inbound
@@ -351,7 +412,7 @@ After the exchange in §10–§11, the state on each side is:
 | `g_message` (2)  | federation_id = M2, sender = Bob             | federation_id = **M2**, sender = Bob         |
 | `thread`         | one row — Alice's view                       | one row — Bob's view                         |
 | `message` × 2    | Alice's Sent (M1) + Alice's Inbox (M2)       | Bob's Inbox (M1) + Bob's Sent (M2)           |
-| `federation_delivery` | one row (outbound M1 to example.com)    | one row (outbound M2 to 103mail)             |
+| `federation_outbox` | one row (outbound M1 to example.com)    | one row (outbound M2 to 103mail)             |
 
 The federated identifiers `T`, `M1`, `M2` are identical across both databases; the autoincrement local ids are not. This is what makes reply correlation and idempotent re-delivery possible.
 
@@ -459,7 +520,7 @@ The random-local-part trick for privacy is preserved; only the domain suffix is 
 
 #### 13.6 Delivery between co-hosted Domains short-circuits federation
 
-When Alice at `103mail.com` sends to Bob at `example.com` **and both Domains are co-hosted on the same Server**, the fan-out loop in §4 takes the local branch for both recipients. No envelope is built, no HTTP is emitted, no signature is computed, no `federation_delivery` row is written. The exchange is a pure in-process database operation — exactly as it would be for two users on the same DNS domain.
+When Alice at `103mail.com` sends to Bob at `example.com` **and both Domains are co-hosted on the same Server**, the fan-out loop in §4 takes the local branch for both recipients. No envelope is built, no HTTP is emitted, no signature is computed, no `federation_outbox` row is written. The exchange is a pure in-process database operation — exactly as it would be for two users on the same DNS domain.
 
 This short-circuit is based on Server co-location (membership in `local_domains`), not Customer co-ownership. Two Domains owned by the **same Customer** short-circuit trivially — they share `customer_id` and Alice's and Bob's mailboxes sit in the same tenant rows. Two Domains owned by **different Customers** on the same Server also short-circuit, but the write crosses `customer_id`: Alice is in Customer A's rows, Bob is in Customer B's rows, and the per-recipient insert into Bob's `thread` / `message` has to happen under B's tenancy. That is permitted — it is the same operation that happens today when Acme's user messages Beta's user on a shared backend — but it is the one place where the `customer_id` boundary is crossed by a write. Customer-level data isolation (§0) still holds for reads: Alice cannot see Bob's folder tree, Bob cannot see Alice's Sent.
 
@@ -502,36 +563,41 @@ The federation protocol does not change. The operator gains two orthogonal deplo
 
 ### 14. Shadow mailboxes for unreachable domains
 
-When Alice sends to `bob@unknown.com` and `unknown.com` has no federation endpoint, the message cannot be pushed. Three behaviors are possible: bounce immediately (SMTP-style), bounce after a retry budget, or **hold the message in a local shadow mailbox until the domain is reachable**. We take the third — it gives the sender a "delivered" experience, preserves history across the gap, and later produces a clean hand-off when the remote domain joins the federation.
+**Scope — this is only for unknown *domains*, not unknown *users*.** When Alice composes to `X@Y`:
 
-The cost is identity management: a shadow is an unclaimed placeholder mailbox for a person who does not (yet) control any account on this Server. That cost is paid by the **claim protocol** (§14.4), which transfers shadow history to the real mailbox over federation once the domain becomes reachable.
+- `Y` federates and `X` exists there → normal §6 delivery.
+- `Y` federates but `X` does not exist → the destination returns `404 no_recipients` per RFC §6.3, the Origin generates a local bounce per §6.4, and §14 does **not** apply. Unknown users on federated domains bounce; they are never shadowed.
+- `Y` does not federate (permanent — e.g. `gmail.com`, or terminal discovery failure on a DNS domain that may federate later) → this section applies.
 
-#### 14.1 The shadow_alias table
+When Alice sends to `bob@unknown.com` and `unknown.com` has no federation endpoint, the message cannot be pushed. Three behaviors are possible: bounce immediately (SMTP-style), bounce after a retry budget, or **hold the message in a shadow mailbox until the domain is reachable**. We take the third — it gives the sender a "delivered" experience, preserves history across the gap, and later produces a clean hand-off when the remote domain joins the federation.
 
-A new table maps external addresses to local placeholder users, separately from the regular `alias` table:
+**Where does the shadow live? Always at a registrar — never at the sender.** A non-registrar sender does not hold shadows locally. Instead, per §15.4, every non-registrar Domain has a single **Default Registrar** configured, and the sender's fan-out federates the undeliverable send to that registrar as an ordinary §6 envelope. The registrar runs §15.5, which includes the shadow-creation step. This is the same mechanism §15 uses for external-address recipients; §14 is the life-cycle view (hold → discover → claim → backfill) of what §15.5 step 3 creates.
+
+A registrar that sends to an unknown domain creates the shadow in its own tenancy directly (no self-federation step).
+
+The cost is identity management: a shadow is an unclaimed placeholder mailbox for a person who does not (yet) control any account on any Server. That cost is paid by the **claim protocol** (§14.4), which transfers shadow history to the real mailbox over federation once the domain becomes reachable, or by the real-email claim paths in §15.6.
+
+#### 14.1 The shadow record
+
+A shadow is an entry in the registrar's extended `alias` table (§15.2) with `state = 'tentative'`. There is **no** separate `shadow_alias` table; unifying on the §15.2 alias shape means a shadow, a forwarder, and an active canonical are all rows in one table distinguished only by `state`. The `alias.real_email` column holds the external address (e.g. `bob@unknown.com`); `alias.email` is the registrar-side 7-digit canonical (`{7digit}@{registrar_domain}`, §13.5) that backs the placeholder mailbox. Claim bookkeeping (`issued_at`, `expires_at`, transition to `forwarder` / tombstone) comes from §15.2 as well.
+
+The backing `user` row is a normal row in the registrar's tenant — a `customer` whose mailboxes happen to hold tentative shadows alongside real users. It has no password, no login history, and is never login-enabled while the alias is `tentative`. The mailbox accumulates messages; nothing authenticates into it.
+
+**Which Domain hosts the shadow?** Always the registrar, never the sender.
+
+- If the sender is a non-registrar Domain, its Default Registrar (§15.4) receives the federation envelope and creates the shadow under its own active Domain. Alice on `example.com` (non-registrar) sending to `bob@unknown.com` produces a shadow at, say, `103mail.com` — because `103mail.com` is `example.com`'s Default Registrar, not because it's Alice's home.
+- If the sender is itself a registrar, the shadow is created locally under the sender's active Domain (no self-federation step).
+
+This is one change from the earlier draft, which let non-registrars hold shadows at the sender's own Domain. Routing all shadows through the Default Registrar keeps the shadow population concentrated on a small number of Domains that actually offer the `/registrar/*` endpoints, avoids split-brain shadows across all senders that ever tried to reach a given external email, and matches §15's real-email model.
+
+Two shadows for the same `bob@unknown.com` can still exist if two different registrars each received an envelope from their own sender-base. That case is handled by §16.4 consolidation, not by §14 alone — when any one registrar transitions the address to claimed, peer registrars' pending shadows are pulled in.
+
+#### 14.2 Onboarding trigger: fan-out fall-through on the registrar
+
+The §4 fan-out loop has three relevant branches:
 
 ```
-shadow_alias (
-  id,
-  external_email    VARCHAR  UNIQUE,   -- "bob@unknown.com"
-  user_id           FK user,           -- the local shadow user
-  created_at,
-  claimed_at        NULLABLE,          -- set when §14.4 completes
-  claimed_by_domain NULLABLE           -- the domain that federated the claim
-)
-```
-
-The referenced `user` row is a normal row in a normal `customer` — the only thing unusual is that it has no password, no login history, and its single `alias` is the random `{7digit}@{hosting_domain}` handle (§13.5). Nobody can log in; the mailbox accumulates messages.
-
-**Which hosting Domain?** On a multi-Domain Server (§13), the shadow is created under the **sender's** active Domain. Alice on 103mail triggers `1234567@103mail.com`; an Example Mail user triggering the same address would get a separate `7654321@example.com` shadow. This keeps blast-radius scoped, and it mirrors the existing §13.5 rule that auto-onboarding uses the active Domain.
-
-Yes, this means two shadows may exist for the same `bob@unknown.com` if two hosted domains each had a sender reach out. That is fine; both get claimed independently in §14.4.
-
-#### 14.2 Onboarding trigger: fan-out fall-through
-
-The §4 fan-out loop gains a third branch **after** local and remote:
-
-```
+# On the SENDER (both registrar and non-registrar):
 for each subscriber email:
     domain = parse(email)
     if domain in local_domains:
@@ -539,21 +605,58 @@ for each subscriber email:
     else if domain.is_local == false and domain.backend_url is set:
         remote branch (unchanged — federation push)
     else:
-        # domain is unknown OR discovery has failed
-        shadow branch:
-            row = shadow_alias.find_or_create(external_email = email,
-                                              domain         = active_domain)
-            deliver locally into row.user_id's Inbox
-            (original To: header preserved — no rewriting)
+        # domain is unknown OR discovery has terminally failed
+        if this Domain is a registrar:
+            run registrar branch locally (§15.5)   # shadow lives here
+        else:
+            federate envelope to our Default Registrar (§15.4)
+            # shadow lives on the Default Registrar, not here
 ```
 
-"Discovery has failed" means: a `/.well-known/webmail-federation` probe has been attempted and returned 404 / connection refused / TLS failure / invalid JSON. Transient failures (timeouts, 5xx) do **not** trigger the shadow branch; they keep the envelope in `federation_delivery` with `status = pending` and retry. The shadow branch is only for the terminal "this domain does not participate".
+"Discovery has terminally failed" means: a `/.well-known/webmail-federation` probe has been attempted and returned 404 / connection refused / TLS failure / invalid JSON. Transient failures (timeouts, 5xx) do **not** trigger this branch; they keep the envelope in `federation_outbox` with `status = pending` and retry until the budget is exhausted. The fall-through branch is only for the terminal "this domain does not participate" signal.
 
-Alice's Sent folder still shows `bob@unknown.com` as the recipient. The shadow alias is never surfaced in her UI.
+On the registrar, §15.5 step 3 creates the tentative alias, inserts the message into the backing mailbox under the registrar's tenant, and enqueues the SMTP notification (§14.2.1).
+
+Alice's Sent folder still shows `bob@unknown.com` as the recipient. The shadow is never surfaced in her UI; she cannot tell from the compose experience whether the message ended up at her Default Registrar or a local shadow on her own Domain.
+
+#### 14.2.1 SMTP notification to the external address
+
+Whenever a registrar creates a tentative shadow, it **MUST** emit a metadata-only SMTP notification to the external address, telling the recipient they have mail waiting and how to claim it. The notification is sent the first time the shadow is created; subsequent messages into the same shadow **SHOULD NOT** re-notify — this is a one-shot "you have a new mailbox" signal, not a per-message alert.
+
+The notification reuses the existing `sent_email` table and `email_template` machinery (see /home/maurits/projects/webmail/specs/001-internal-messaging/data-model.md). A new template is added:
+
+```
+email_template(
+  name:           "shadow_onboarding_invite",
+  language:       "en",
+  sender_name:    "{registrar_brand.name}",
+  sender_email:   "noreply@{registrar_domain}",
+  subject:        "You have messages waiting at {registrar_brand.name}",
+  body:           <metadata-only; see below>,
+  parameters:     [ "external_email", "sender_display",
+                    "message_count_hint", "claim_url" ]
+)
+```
+
+Body outline (strictly metadata — no message body content, per the project's notifications-only invariant, /home/maurits/projects/webmail/specs/001-internal-messaging/data-model.md:95):
+
+> Hi,
+>
+> Someone sent a message to **{external_email}**, but that address isn't on a federated mail service yet. {registrar_brand.name} is holding the message for you.
+>
+> You can claim this mailbox by clicking the link below. It's free, and you can either sign up here or link an existing federated account to collect the mail:
+>
+> → {claim_url}
+>
+> If you don't recognize this, you can ignore this email — the link expires in 30 days, and we'll stop notifying you.
+
+`claim_url` points at `https://webmail.{registrar_domain}/claim?token=...` per §15.6. The `sent_email` row records the invite as an audit trail, the same as every other notification emitted by the system. If SMTP delivery of the invite itself fails terminally (e.g. the external address bounces), the shadow stays but the invite flag is marked undeliverable; subsequent sends to the same external email do not re-attempt notification.
+
+The notification is distinct from — and must not be confused with — the per-message notifications a user receives for mail in a mailbox they already own. A shadow's backing mailbox never emits per-message notifications because nobody owns it; only the single onboarding invite is sent.
 
 #### 14.3 Discovery promotion
 
-A background worker re-probes every domain with `domain.backend_url IS NULL` and at least one unclaimed `shadow_alias`. Frequency: low (hourly is fine). When a probe succeeds:
+A background worker on every registrar re-probes every `domain` row with `domain.backend_url IS NULL` for which the registrar holds at least one `alias` with `state = 'tentative'`. Frequency: low (hourly is fine). When a probe succeeds:
 
 1. The `domain` row is promoted: `backend_url`, `public_key`, `last_seen_at` populated.
 2. An **offer** envelope is sent to the newly-federated peer (§14.4), one per external email that has a shadow on our side.
@@ -610,7 +713,7 @@ X-Federation-Signature: ed25519(body)
 }
 ```
 
-The signature over this body by `unknown.com`'s pinned key is the sole proof of control. 103mail verifies, looks up the `shadow_alias`, and proceeds to backfill.
+The signature over this body by `unknown.com`'s pinned key is the sole proof of control. The holding registrar (103mail in this example) verifies, looks up the tentative `alias` row for `bob@unknown.com`, and proceeds to backfill.
 
 If Bob rejects (or the offer expires after, say, 30 days), 103mail may either re-offer on the next send to `bob@unknown.com` or delete the shadow and bounce future sends. Suggest re-offer forever — deletion is destructive and there's no strong reason to forget.
 
@@ -633,9 +736,9 @@ unknown.com treats these envelopes like any other inbound, except:
 
 After all backfill envelopes are acknowledged:
 
-1. 103mail sets `shadow_alias.claimed_at = NOW()`, `claimed_by_domain = "unknown.com"`.
-2. The shadow user / customer / alias / folder rows are **soft-deleted** (tombstone, not dropped — audit trail).
-3. `shadow_alias` itself is retained as a historical pointer; future lookups for `bob@unknown.com` miss it (the domain is now federated, normal remote branch applies).
+1. The holding registrar transitions the tentative alias: `alias.state = 'tombstone'`, records the claiming domain, and timestamps the transition. The §15.2 `state` enum already has `tombstone`; no separate `shadow_alias.claimed_at` column is needed.
+2. The backing user / mailbox / folder rows are **soft-deleted** (marked deleted, not dropped — audit trail).
+3. The `alias` row is retained as a historical pointer: future lookups for `bob@unknown.com` see a tombstoned alias and fall through to the normal remote branch (the domain is now federated).
 
 #### 14.5 State machine
 
@@ -668,26 +771,30 @@ Terminal states: `federated remote` and `claimed + tombstone`. Everything else i
 
 #### 14.6 Sender-visible semantics
 
-- **During shadow hold:** Alice sees her message in Sent as usual, recipient `bob@unknown.com`. No bounce, no "pending" indicator. If she sends again, the shadow_alias lookup short-circuits — the new message joins the same shadow mailbox.
-- **At claim time:** Alice sees nothing. The backfill is entirely a 103mail → unknown.com internal matter.
+- **During shadow hold (sender side):** Alice sees her message in Sent as usual, recipient `bob@unknown.com`. No bounce, no "pending" indicator; the envelope hit Alice's Default Registrar (if Alice is on a non-registrar Domain) with a `202 Accepted` and her view doesn't know or care what happened next. If she sends again, the registrar's §15.5 step 1 matches the tentative alias and the new message joins the same shadow mailbox.
+- **At claim time:** Alice sees nothing. The backfill is entirely a registrar → claimed-domain internal matter.
 - **After claim, on reply:** Bob replies from `bob@unknown.com`. The reply arrives at Alice via the normal §11 path; the `thread.federation_id` matches Alice's existing `g_thread`, so the reply appears threaded under her original message. From her perspective, Bob "finally got back to her" — the claim is invisible.
+- **Unknown *user* on a known federated domain is NOT this flow.** If Alice sends to `nosuchbob@example.com` and `example.com` federates but has no such recipient, the destination returns `404 no_recipients` (RFC §6.3); Alice gets a local bounce (RFC §6.4). No shadow is ever created.
 
 #### 14.7 Edge cases
 
-- **Two operators host shadows for the same external email.** Each emits its own offer; Bob can accept both, and his backend receives two backfills that may or may not overlap. Thread correlation by `federation_id` handles any overlap gracefully (dedupe on `(origin_domain, envelope_id)` from §6).
-- **Sender spoofing of offers.** The offer is signed by the purported old-host's domain key, pinned via the same TOFU rules as regular federation (§5). A third party cannot inject fake offers.
-- **Bob does not exist on unknown.com yet.** Offers queue on unknown.com keyed by `external_email`; when the local account is first created (via normal onboarding), pending offers are surfaced at login.
-- **Key rotation of the old host between shadow creation and claim.** Not a problem — shadow creation does not cryptographically bind to the old-host's key at creation time; the offer is signed fresh at offer time with whatever key is current, and the claim signature from the new host is what 103mail verifies against the new host's pinned key.
-- **Replay of a claim.** 103mail stores `(offer_id, claim_id)` and refuses duplicates.
+- **Two registrars hold shadows for the same external email.** Each received an envelope from its own sender-base and created a local shadow. Neither is wrong. When one transitions to `active` or `forwarder`, §16.4 pulls in the peers' pending shadows via the consolidation path; overlap between backfills is deduped by `(origin_domain, envelope_id)` (§5.4) and by thread correlation on `federation_id`.
+- **Sender spoofing of offers.** The offer (§14.4) is signed by the purported old-host registrar's domain key, pinned via TOFU (§5). A third party cannot inject fake offers.
+- **Bob does not exist on unknown.com yet at the moment of claim.** Offers queue on unknown.com keyed by `external_email`; when the local account is first created there via normal onboarding, pending offers are surfaced at login.
+- **Key rotation of the registrar between shadow creation and claim.** Not a problem — the shadow's creation does not bind to the registrar's key at creation time; the offer is signed fresh at offer time with whatever key is current, and the claim signature from the new host is what the registrar verifies against the new host's pinned key.
+- **Replay of a claim.** The registrar stores `(offer_id, claim_id)` and refuses duplicates.
+- **SMTP invite to the external address bounces.** The shadow stays; the invite is flagged undeliverable and not re-sent on subsequent messages. A domain that later federates can still trigger the §14.4 claim flow — the invite was a convenience for the recipient, not a prerequisite for claim.
+- **Shadow creation on the registrar when no Default Registrar is reachable.** A non-registrar sender whose Default Registrar is down for longer than the retry budget (§10) generates a local bounce to Alice; it does **not** fall back to holding the shadow locally. Centralizing shadows on registrars is a hard rule, not a best-effort one.
 
 #### 14.8 What this adds to the schema
 
-- `shadow_alias` table (§14.1).
-- One new outbound endpoint on every peer: `POST /api/v1/federation/shadow-offer`.
-- One new outbound endpoint on every peer: `POST /api/v1/federation/claim`.
+- No new `shadow_alias` table — shadows are rows in the §15.2-extended `alias` table with `state = 'tentative'`.
+- One new inbound endpoint on every registrar: `POST /api/v1/federation/shadow-offer` (§14.4).
+- One new inbound endpoint on every registrar: `POST /api/v1/federation/claim` (§14.4).
+- One new `email_template` row: `shadow_onboarding_invite` (§14.2.1).
 - No changes to `g_thread` / `g_message` — backfill uses the existing inbound envelope with two optional fields.
 
-The federation protocol remains additive: a peer that does not implement §14 still federates normally for reachable domains; shadows simply never claim out to it, which is the same behavior as "the domain never federates". Claim is a pure capability upgrade.
+The federation protocol remains additive: a peer that does not implement §14 (i.e. is not a registrar) still federates normally for reachable domains and bounces for unreachable ones. Shadow-holding is strictly a registrar capability, composed on top of §15 rather than layered underneath it.
 
 ### 15. Real-email addressing
 
@@ -748,30 +855,45 @@ Signup is gated on real_email verification (double opt-in):
 
 Unverified accounts cannot send or receive. Users may log in with either their canonical or their real_email as username; both are domain-scoped.
 
-#### 15.4 Compose — non-registrar
+#### 15.4 Compose — non-registrar (the Default Registrar)
 
-Non-registrars do no real-email lookup themselves. The §4 fan-out gains one branch at the end:
+Non-registrars do no real-email lookup themselves, and they do not hold shadows locally (§14.1). Instead, every non-registrar Domain has exactly one **Default Registrar**: a single federated Domain — chosen at config time by the non-registrar's operator — that receives every send the non-registrar cannot deliver itself, and that holds shadows and notifies external recipients on the non-registrar's behalf.
+
+**The Default Registrar invariant.** Every non-registrar Domain **MUST** have a Default Registrar configured. Boot fails fast if it is missing. This is what makes the fan-out below total — there is no "no registrar available" branch to reason about, at runtime or in code.
+
+**Config shape:**
+
+```
+'default_registrar' => [
+    'domain'     => '103mail.com',
+    'pinned_key' => 'ed25519:...',
+],
+'fallback_registrars' => [                 # optional; empty by default
+    ['domain' => 'mailhub.org',     'pinned_key' => 'ed25519:...'],
+],
+```
+
+`default_registrar` is a single entry, not a list, because the designation is singular: it's the one Domain that becomes the home for this non-registrar's tentative shadows (§14.1). `fallback_registrars` exists only as a federation-retry safety net if the Default is unreachable beyond the normal retry window (§10); it never sees traffic when the Default is healthy, which prevents split-brain shadows for the same external address across multiple registrars for the same sender Domain.
+
+A registrar Domain (`registrar: true`) satisfies the invariant on its own — it runs §15.5 locally and does not configure a Default Registrar.
+
+**Fan-out for non-registrars:**
 
 ```
 for each subscriber "X@Y":
     if Y ∈ local_domains:      local branch (unchanged)
     else if Y is federated:    federation branch (§4)
-    else:                      registrar branch — federate to configured registrar
-                               with recipient = "X@Y" unchanged.
+                               # includes the "unknown user on known domain"
+                               # case, which 404s per RFC §6.3 and becomes
+                               # a local bounce — no shadow, no registrar.
+    else:                      registrar branch — federate to the
+                               Default Registrar with recipient = "X@Y"
+                               unchanged. The registrar runs §15.5,
+                               which either resolves or creates a shadow
+                               and emits the §14.2.1 SMTP invite.
 ```
 
-Non-registrars point at one or more registrars in `config/domain.php`:
-
-```
-'registrars' => [
-    ['domain' => '103mail.com',     'pinned_key' => 'ed25519:...'],
-    ['domain' => 'mailhub.org',     'pinned_key' => 'ed25519:...'],
-],
-```
-
-**Invariant:** every federated server must be able to resolve an unknown real_email. A domain with `registrar: true` satisfies this on its own (it runs §15.5 locally). A non-registrar satisfies it by configuring at least one entry in `registrars` — boot fails fast if the list is empty. Enforcing this at config load keeps the §15.4 fan-out total: there is no "no registrar available" branch to reason about.
-
-Outbound federation to a registrar reuses the §6 inbound envelope unmodified; the registrar is responsible for resolving or onboarding the non-federated recipient (§15.5). The sending domain never fans out to more than one registrar. The **first entry** in `registrars` is the domain's designated auto-registration home: all unknown-recipient sends go there, so any tentative shadow created for this domain's users lands on a single, predictable registrar. Additional entries exist only as federation-retry fallbacks if the first is unreachable after the normal retry window (§10); they never see traffic otherwise, which prevents split-brain shadows across registrars for the same sender domain.
+Outbound federation to the Default Registrar reuses the §6 inbound envelope unmodified; the registrar is responsible for resolving or onboarding the non-federated recipient (§15.5). The sending Domain never fans out to more than one registrar for a given external address and **MUST** keep that selection stable across retries (RFC §8.2).
 
 #### 15.5 Compose — registrar
 
@@ -791,7 +913,10 @@ When a registrar is asked to deliver to `X@Y` where `Y` is not a federated domai
      alias(state='tentative', real_email='X@Y',
            issued_at=NOW, expires_at=NOW+90d)
      plus 7-digit canonical on this registrar
-     deliver the message locally; SMTP invite to X@Y
+     deliver the message locally (the shadow mailbox, §14)
+     emit the §14.2.1 `shadow_onboarding_invite` SMTP notification to X@Y
+       (only on first creation — subsequent messages to the same
+        tentative alias do not re-notify).
 ```
 
 Tentative shadows do not answer `/lookup` as authoritative and do not announce to peers. They are registrar-local until claim.
@@ -964,15 +1089,15 @@ A single-registrar deployment (only 103mail) is this protocol with an empty `reg
 1. **Client**: introduce `/config.json` + `DomainContext`, strip literal `103mail.com` from source.
 2. **Backend**: move default domain to domain config; add `domain.backend_url` / `public_key` / `is_local`.
 3. **Backend**: add well-known discovery route + keypair generation on first boot.
-4. **Backend**: split `addMessageToSubscribers` into local/remote branches; add outbound `FederationClient` + `federation_delivery` table + retry worker.
+4. **Backend**: split `addMessageToSubscribers` into local/remote branches; add outbound `FederationClient` + `federation_outbox` table + retry worker.
 5. **Backend**: add inbound `FederationApi` with signature verification.
 6. **Spin up** a second domain (e.g. `example.com`) in staging, verify round-trip: compose from 103mail → inbox on example.com → reply federates back.
-7. **Harden**: rate-limit inbound per peer, cap attachment size, bounce semantics (`federation_delivery.status = permanent_failure` generates a local bounce message to sender).
+7. **Harden**: rate-limit inbound per peer, cap attachment size, bounce semantics (`federation_outbox.status = permanent_failure` generates a local bounce message to sender).
 8. **Schema (all domains)**: `user.real_email` + `real_email_verified_at` + unique `(domain_id, real_email)`.
 9. **Registration (all domains)**: require real_email at signup; SMTP double-opt-in; gate account activation on verification.
 10. **Notifications (all domains)**: wire `sent_email` `To:` to `user.real_email`.
 11. **Schema (registrars)**: `alias.real_email`, `alias.forward_canonical`, `alias.state`, `alias.issued_at`, `alias.expires_at`.
-12. **Compose (non-registrars)**: add `registrars` config; extend §4 fan-out with the registrar branch — federate non-federated recipients to the configured registrar.
+12. **Compose (non-registrars)**: add `default_registrar` (required) and optional `fallback_registrars` config; extend §4 fan-out with the registrar branch — federate non-federated recipients to the Default Registrar (§15.4). Boot fails if `default_registrar` is missing on a non-registrar Domain.
 13. **Compose (registrars)**: implement §15.5 — local match, peer match, auto-onboarding with tentative shadow + SMTP invite + claim page (both signup and federated-claim paths).
 14. **Federation (registrars)**: `POST /api/v1/federation/claim-by-real-email`; reuse §14.4 backfill for messages moving out of a shadow.
 15. **Multi-registrar (registrars)**: expose `/api/v1/registrar/lookup` and `/api/v1/registrar/pending-shadows`; add `registrar_peers` config; cross-registrar query on lookup miss; consolidation on claim.
