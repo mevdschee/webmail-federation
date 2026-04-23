@@ -25,26 +25,26 @@ React 19 + MUI, currently mock-only. `103mail.com` is hardcoded in `AuthFlow.tsx
 ### 1. Deployment topology
 
 ```
-mail.103mail.com    ──┐
-mail.example.com    ──┼──►  static bundle of webmail-client (CDN)
-mail.acme.io        ──┘
-
-api.103mail.com     ◄──►  webmail backend (103mail domain)
-api.example.com     ◄──►  webmail backend (example.com domain)
-api.acme.io         ◄──►  webmail backend (acme.io domain)
+webmail.103mail.com   ◄──►  client bundle + webmail backend (103mail domain)
+webmail.example.com   ◄──►  client bundle + webmail backend (example.com domain)
+webmail.acme.io       ◄──►  client bundle + webmail backend (acme.io domain)
 ```
 
-One client bundle; one or more Servers. Each Domain has its own hostname, keypair, and branding. A Server **MAY** host a single Domain (the minimal deployment) or several co-hosted Domains sharing a process and DB (§13); peers can't tell the difference. Domains exchange mail via **federation HTTP**, not SMTP.
+**One Domain, one hostname.** Every Domain serves its entire webmail surface — the static client bundle, the REST API, the federation endpoints, and the `/.well-known/webmail-federation` descriptor — under the single hostname `webmail.{domain}`. No other subdomain (`mail.`, `api.`, `m.`, the apex) is permitted for any webmail-federation endpoint; this is normative in the RFC (§1 Federation hostname, §4.1, §9.1). The client bundle and the API share an origin, which also removes the cross-origin handshake between them.
+
+**Transport.** `https://webmail.{domain}` **MUST** be served over TLS 1.2+ with an X.509 certificate that chains to the Web PKI and is valid for `webmail.{domain}`. Domain-validated (DV) certificates are the minimum acceptable validation level — free issuers like Let's Encrypt satisfy the requirement. OV/EV certificates are permitted but not required. Self-signed certificates, private-CA certificates, and certificates whose SANs do not cover `webmail.{domain}` are not compliant.
+
+Each Domain has its own keypair and branding. A Server **MAY** host a single Domain (the minimal deployment) or several co-hosted Domains sharing a process and DB (§13); peers can't tell the difference. Domains exchange mail via **federation HTTP**, not SMTP.
 
 ### 2. Client: drop the domain hardcode
 
 Single bundle, per-domain runtime config resolved from the hostname:
 
-- Add `/config.json` served by each backend (or inlined at build of a per-domain `index.html`):
+- Add `/config.json` served by each backend at `https://webmail.{domain}/config.json`:
   ```json
   {
     "domain": "103mail.com",
-    "apiBase": "https://api.103mail.com/api/v1",
+    "apiBase": "https://webmail.103mail.com/api/v1",
     "brand": {
       "name": "103mail",
       "logo": "/103mail.svg",
@@ -52,6 +52,7 @@ Single bundle, per-domain runtime config resolved from the hostname:
     }
   }
   ```
+  `apiBase` **MUST** be rooted at `https://webmail.{domain}`; the client rejects any config that points elsewhere, matching the RFC rule that all protocol endpoints live under the single Federation hostname.
 - Client bootstraps by fetching `/config.json` before first render; passes the result through a `DomainContext`.
 - Replace hardcoded `/103mail.svg`, `https://103mail.com` link, and `@103mail.com` mock strings with `config.brand.*` / `config.domain`.
 - Login form: local part only, with `@{config.domain}` shown as an adornment — reinforces that each hostname is a single Domain.
@@ -92,17 +93,19 @@ Invariant: `g_thread` / `g_message` / `g_attachment` are written once locally so
 
 ### 5. Peer discovery + trust
 
-- Each backend exposes `/.well-known/webmail-federation`:
+- Each backend exposes its peer descriptor at the fixed Federation hostname `https://webmail.{domain}/.well-known/webmail-federation`:
   ```json
   {
     "domain": "example.com",
-    "backend": "https://api.example.com",
-    "inbound": "https://api.example.com/api/v1/federation/inbound",
+    "backend": "https://webmail.example.com",
+    "inbound": "https://webmail.example.com/api/v1/federation/inbound",
     "public_key": "ed25519:..."
   }
   ```
-- First time 103mail needs to talk to `example.com`: HTTP `GET https://example.com/.well-known/webmail-federation`, pin the pubkey into the `domain` row, cache for 24h.
-- No CA needed — TOFU + well-known, same shape as Matrix server-to-server.
+  The descriptor's `backend` and `inbound` **MUST** be rooted at `https://webmail.{domain}`. A descriptor advertising any other hostname is rejected.
+- First time 103mail needs to talk to `example.com`: HTTP `GET https://webmail.example.com/.well-known/webmail-federation`, pin the pubkey into the `domain` row, cache for 24h. A 103mail peer **MUST NOT** probe the apex (`https://example.com/...`) or any alternative subdomain; discovery is a fixed-URL fetch, not a search.
+- The fetch is HTTPS-only and the certificate **MUST** be a Web-PKI certificate valid for `webmail.example.com` (DV minimum, §1). Self-signed, private-CA, and bare-hostname certificates are refused at the TLS layer before any descriptor bytes are read.
+- Web-PKI CA chain + TOFU pubkey pin: the CA check authenticates the hostname at first contact; the pinned Ed25519 key authenticates every subsequent envelope regardless of CA changes.
 
 ### 6. Inbound federation endpoint
 
@@ -145,7 +148,7 @@ Alice (`1234567@103mail.com`) composes a message to Bob (`bob@example.com`). Bot
 **Step A — client → origin backend.** Alice's browser posts the usual compose payload to her own backend:
 
 ```
-POST https://api.103mail.com/api/v1/email/thread/{folderId}
+POST https://webmail.103mail.com/api/v1/email/thread/{folderId}
 Authorization: Bearer {alice's token}
 
 {
@@ -177,10 +180,10 @@ No local mailbox is created for Bob (§8). A `contact` row for Bob is upserted f
 **Step D — origin backend discovers example.com (first time only).** If `domain.last_seen_at` is stale or missing:
 
 ```
-GET https://example.com/.well-known/webmail-federation
+GET https://webmail.example.com/.well-known/webmail-federation
 ```
 
-The returned `public_key` is pinned into the `domain` row on TOFU (§5). Cached for 24h.
+The fetch enforces TLS with a Web-PKI DV-or-better certificate valid for `webmail.example.com`; any cert failure aborts discovery (no fallback to the apex, no plaintext, no private-CA override). The returned `public_key` is pinned into the `domain` row on TOFU (§5). Cached for 24h.
 
 **Step E — origin backend enqueues the envelope.** A row is inserted into `federation_delivery`:
 
@@ -194,7 +197,7 @@ The actual HTTP call is done by a background worker, so Alice's compose HTTP req
 **Step F — worker signs and posts the envelope.** The worker picks up the pending row and sends:
 
 ```
-POST https://api.example.com/api/v1/federation/inbound
+POST https://webmail.example.com/api/v1/federation/inbound
 X-Federation-Version:   0.1
 X-Federation-Sender:    103mail.com
 X-Federation-Nonce:     {uuidv7}
@@ -229,7 +232,7 @@ On `202 Accepted`, `federation_delivery.status` flips to `delivered`. On transie
 4. Writes local `g_thread` / `g_message` rows, carrying over the `federation_id` values so replies can correlate.
 5. Calls the **local** branch of `addMessageToSubscribers` for `bob@example.com`: if Bob has no account, the existing auto-onboarding creates `customer` + `user` + `mailbox` + `folder` + `alias` — but now with an `@example.com` alias, because this backend's domain config says its local domain is `example.com`.
 6. Inserts Bob's per-user `thread` / `message`, unread.
-7. Enqueues a `sent_email` notification linking to `https://mail.example.com/...` — **Bob's home backend**, not Alice's.
+7. Enqueues a `sent_email` notification linking to `https://webmail.example.com/...` — **Bob's home backend**, not Alice's.
 
 Bob receives the notification email, clicks the link, logs into his example.com mailbox, and reads the message. 103mail.com never touches Bob's credentials or mailbox contents.
 
@@ -240,7 +243,7 @@ Bob opens the thread and hits Reply. The reply travels back along the same rails
 **Step A — Bob's client → example.com backend.** The client posts a reply to example.com's backend:
 
 ```
-POST https://api.example.com/api/v1/email/message/{threadId}
+POST https://webmail.example.com/api/v1/email/message/{threadId}
 Authorization: Bearer {bob's token}
 
 { "body": "Thanks Alice — ...", "attachments": [] }
@@ -260,7 +263,7 @@ Bob's per-user Sent copy is written, unread-for-others.
 **Step D — example.com enqueues and posts to 103mail.** A `federation_delivery` row is inserted on the example.com side (the table lives on whichever server is the origin of a given envelope). The worker posts:
 
 ```
-POST https://api.103mail.com/api/v1/federation/inbound
+POST https://webmail.103mail.com/api/v1/federation/inbound
 X-Federation-Sender: example.com
 X-Federation-Signature: ...
 
@@ -295,7 +298,7 @@ Two things to note:
 3. Looks up `g_thread` by `federation_id`. **Found** — this is a reply to an existing thread, not a new thread. No new `g_thread` row is created.
 4. Appends a new `g_message` (with Bob's federation id) under that existing `g_thread`.
 5. Walks the thread's **local** subscribers and inserts a per-user `message` row for Alice, unread, into her existing `thread`.
-6. Enqueues a `sent_email` notification to Alice linking to `https://mail.103mail.com/...`.
+6. Enqueues a `sent_email` notification to Alice linking to `https://webmail.103mail.com/...`.
 
 Alice gets notified, opens her thread, and sees Bob's reply appended under the same subject. From her UI the conversation looks local — threading, unread counts, and quoted replies all work as if example.com were just another 103mail user.
 
@@ -326,8 +329,6 @@ Nothing in the wire protocol requires that one DNS domain equal one Server. A si
 local_domains: [
   {
     "domain":          "103mail.com",
-    "hostname":        "mail.103mail.com",
-    "api_hostname":    "api.103mail.com",
     "brand":           { "name": "103mail",  "logo": "/103mail.svg",
                          "marketing_url": "https://103mail.com" },
     "federation_private_key": "ed25519:...",
@@ -335,8 +336,6 @@ local_domains: [
   },
   {
     "domain":          "example.com",
-    "hostname":        "mail.example.com",
-    "api_hostname":    "api.example.com",
     "brand":           { "name": "Example Mail", "logo": "/example.svg",
                          "marketing_url": "https://example.com" },
     "federation_private_key": "ed25519:...",
@@ -345,33 +344,36 @@ local_domains: [
 ]
 ```
 
-Each Domain has its **own** federation keypair — never shared, because remote peers pin keys per DNS domain (§5). Compromise of one Domain's key must not let an attacker impersonate the others co-hosted on the same Server.
+The Federation hostname `webmail.{domain}` is **derived**, not configured, from the `domain` field — `webmail.103mail.com`, `webmail.example.com`. The config loader rejects any attempt to override the hostname (e.g. a legacy `hostname: "mail.103mail.com"` field) so that a deploy cannot accidentally drift away from the RFC's single-hostname rule.
+
+Each Domain has its **own** federation keypair — never shared, because remote peers pin keys per DNS domain (§5). Compromise of one Domain's key must not let an attacker impersonate the others co-hosted on the same Server. Each Domain also **MUST** present an X.509 certificate valid for its own `webmail.{domain}` (DV minimum); a single wildcard certificate covering `webmail.*.{parent-zone}` is acceptable only if it is actually valid for every hosted Domain's Federation hostname.
 
 #### 13.2 Request routing: the Host header selects the domain
 
-Because the browser always knows the user as "the person at `mail.example.com`", the backend picks the active domain from the incoming HTTP `Host` header:
+Because the browser always knows the user as "the person at `webmail.example.com`", the backend picks the active domain from the incoming HTTP `Host` header. Every webmail and federation endpoint lives at a single hostname per Domain — `webmail.{domain}` — so the mapping `Host → active domain` is one lookup:
 
-- `GET https://mail.103mail.com/config.json` → 103mail's brand block.
-- `GET https://mail.example.com/config.json` → example.com's brand block.
-- `POST https://api.103mail.com/api/v1/email/thread/...` → operates inside the 103mail domain.
-- `POST https://api.example.com/api/v1/email/thread/...` → operates inside the example.com domain.
+- `GET https://webmail.103mail.com/config.json` → 103mail's brand block.
+- `GET https://webmail.example.com/config.json` → example.com's brand block.
+- `POST https://webmail.103mail.com/api/v1/email/thread/...` → operates inside the 103mail domain.
+- `POST https://webmail.example.com/api/v1/email/thread/...` → operates inside the example.com domain.
+- `POST https://webmail.103mail.com/api/v1/federation/inbound` → inbound federation, 103mail.
 
-A lightweight middleware at the top of request handling resolves `Host` → one entry in `local_domains`, stores it in request state as `$activeDomain`, and rejects (404) any hostname not in the config. Every downstream call that used to reach for a singleton default domain now takes `$activeDomain` instead.
+A lightweight middleware at the top of request handling resolves `Host` → one entry in `local_domains` by stripping the leading `webmail.` label, stores it in request state as `$activeDomain`, and rejects (404) any hostname whose form is not `webmail.{d}` for some `d` in the config. Requests to the apex (`Host: example.com`), to legacy subdomains (`Host: mail.example.com`, `Host: api.example.com`), or to any other hostname are rejected at the same layer — not silently accepted and routed. Every downstream call that used to reach for a singleton default domain now takes `$activeDomain` instead.
 
 #### 13.3 Each Domain gets its own well-known endpoint
 
 The same Server serves:
 
-- `https://103mail.com/.well-known/webmail-federation` → `{domain: "103mail.com", public_key: "ed25519:K_103", ...}`
-- `https://example.com/.well-known/webmail-federation` → `{domain: "example.com", public_key: "ed25519:K_ex", ...}`
+- `https://webmail.103mail.com/.well-known/webmail-federation` → `{domain: "103mail.com", public_key: "ed25519:K_103", ...}`
+- `https://webmail.example.com/.well-known/webmail-federation` → `{domain: "example.com", public_key: "ed25519:K_ex", ...}`
 
-Selection is again `Host`-based. Peers never learn that these two Domains share a Server.
+Selection is again `Host`-based on the `webmail.{d}` form. The apex (`https://103mail.com/...`) is not a protocol endpoint and **MUST NOT** serve the descriptor; operators may use it for a marketing page or may leave it without a webmail-federation route entirely. Peers never learn that these two Domains share a Server.
 
 #### 13.4 User and mailbox identity stays Domain-local
 
 - A `customer` and a `user` row belong to exactly one Domain. The association is recorded as `user.domain_id` (new column) — there is no "customer that spans Domains". A person who wants accounts on both `103mail.com` and `example.com` has two `user` rows and two `customer` rows, even if both Domains are co-hosted on the same Server.
 - Aliases are already keyed by unique `email`; `alice@103mail.com` and `alice@example.com` coexist without schema change.
-- Login is scoped by the active Domain: the same local-part (`alice`) can log into `mail.103mail.com` and `mail.example.com` and reach different mailboxes. Bearer tokens are issued with the DNS domain embedded, and rejected if used against a different Domain.
+- Login is scoped by the active Domain: the same local-part (`alice`) can log into `webmail.103mail.com` and `webmail.example.com` and reach different mailboxes. Bearer tokens are issued with the DNS domain embedded, and rejected if used against a different Domain.
 
 #### 13.5 Auto-onboarding uses the recipient's domain, not a global default
 
@@ -396,11 +398,11 @@ The random-local-part trick for privacy is preserved; only the domain suffix is 
 
 When Alice at `103mail.com` sends to Bob at `example.com` **and both Domains are co-hosted on the same Server**, the fan-out loop in §4 takes the local branch for both recipients. No envelope is built, no HTTP is emitted, no signature is computed, no `federation_delivery` row is written. The exchange is a pure in-process database operation — exactly as it would be for two users on the same DNS domain.
 
-That property follows from the fan-out rule in §4 unchanged: membership in `local_domains` is the only test. A future operator who splits `example.com` onto its own separate Server flips one row (`domain.is_local = false`, `domain.backend_url = "https://api.example.com"`), and from that point the same send automatically uses federation instead. The sending code path is identical either way; only the branch taken at dispatch time differs.
+That property follows from the fan-out rule in §4 unchanged: membership in `local_domains` is the only test. A future operator who splits `example.com` onto its own separate Server flips one row (`domain.is_local = false`, `domain.backend_url = "https://webmail.example.com"`), and from that point the same send automatically uses federation instead. The sending code path is identical either way; only the branch taken at dispatch time differs.
 
 #### 13.7 Notifications pick the right branded host
 
-The `sent_email` template's base URL now resolves from the **recipient's** Domain config, not from a single default. A notification destined for `bob@example.com` points at `https://mail.example.com/...`, and one destined for `alice@103mail.com` points at `https://mail.103mail.com/...` — even when both are generated by the same Server in the same request.
+The `sent_email` template's base URL now resolves from the **recipient's** Domain config, not from a single default. A notification destined for `bob@example.com` points at `https://webmail.example.com/...`, and one destined for `alice@103mail.com` points at `https://webmail.103mail.com/...` — even when both are generated by the same Server in the same request.
 
 #### 13.8 What is not shared across co-hosted Domains
 
@@ -487,7 +489,7 @@ Claim is a **two-party, federation-signed** handshake. There is no email verific
 When 103mail discovers that `unknown.com` is now federated and has shadow(s), it emits one envelope per shadow to the new peer:
 
 ```
-POST https://api.unknown.com/api/v1/federation/shadow-offer
+POST https://webmail.unknown.com/api/v1/federation/shadow-offer
 X-Federation-Sender:    103mail.com
 X-Federation-Signature: ed25519(body)
 
@@ -514,7 +516,7 @@ The offer is metadata only — no bodies, no attachments. unknown.com stores it 
 If Bob accepts, his backend signs and posts:
 
 ```
-POST https://api.103mail.com/api/v1/federation/claim
+POST https://webmail.103mail.com/api/v1/federation/claim
 X-Federation-Sender:    unknown.com
 X-Federation-Signature: ed25519(body)
 
@@ -715,20 +717,20 @@ Tentative shadows do not answer `/lookup` as authoritative and do not announce t
 
 #### 15.6 Claim
 
-The SMTP invite links to `https://mail.<registrar>/claim?token=...`. The token is single-use, signed, 30-day, bound to a specific tentative shadow.
+The SMTP invite links to `https://webmail.<registrar>/claim?token=...`. The token is single-use, signed, 30-day, bound to a specific tentative shadow.
 
 The claim page offers two options:
 
 **(a) Sign up here.** User sets a password. The tentative shadow is promoted in place: `user.real_email_verified_at = NOW()`, `alias.state = 'active'`. Canonical remains the 7-digit handle. §16.4 consolidation follows.
 
-**(b) I have a federated account.** User enters a canonical, e.g. `bob@example.com`. Registrar redirects to `mail.example.com/federated-claim?token=...&registrar=103mail.com`. example.com authenticates Bob, confirms his `user.real_email` matches the shadow's real_email, and posts a claim back to the registrar (§15.7). §16.4 consolidation follows.
+**(b) I have a federated account.** User enters a canonical, e.g. `bob@example.com`. Registrar redirects to `https://webmail.example.com/federated-claim?token=...&registrar=103mail.com`. example.com authenticates Bob, confirms his `user.real_email` matches the shadow's real_email, and posts a claim back to the registrar (§15.7). §16.4 consolidation follows.
 
 #### 15.7 claim-by-real-email endpoint
 
 Non-registrar → registrar, closing path (b):
 
 ```
-POST https://api.103mail.com/api/v1/federation/claim-by-real-email
+POST https://webmail.103mail.com/api/v1/federation/claim-by-real-email
 X-Federation-Sender:    example.com
 X-Federation-Signature: ed25519(body)
 
@@ -817,7 +819,7 @@ When §15.5 step 1 misses, the registrar queries every entry in `registrar_peers
 
 ```
 for peer in registrar_peers:
-    spawn: GET https://{peer.domain}/api/v1/registrar/lookup?hash=...
+    spawn: GET https://webmail.{peer.domain}/api/v1/registrar/lookup?hash=...
 merge:
     hit → cache locally keyed by (hash, peer.domain)
            TTL = min(response.expires_at - NOW, 24h)
@@ -833,7 +835,7 @@ When a tentative shadow transitions to `active` or `forwarder` on registrar W (e
 
 ```
 for peer in registrar_peers:
-    GET /api/v1/registrar/pending-shadows?hash=... → peer_shadows
+    GET https://webmail.{peer.domain}/api/v1/registrar/pending-shadows?hash=... → peer_shadows
 ```
 
 If any peer returns shadows, the claiming user sees a consolidated UI:

@@ -21,6 +21,8 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **
 The following terms are used throughout:
 
 - **Domain** — The logical Webmail-Federation participant. A Domain is authoritative for exactly one DNS domain and for the mailboxes local to it. All protocol rules in this document apply per-Domain.
+- **DNS domain** — The bare internet domain a Domain is authoritative for (e.g. `example.com`). Distinct from the **Federation hostname** (below), which is where the Domain's endpoints are served.
+- **Federation hostname** — The fixed hostname `webmail.{domain}` under which every endpoint defined by this document is served. All protocol URLs — the well-known endpoint (§4.1), the inbound endpoint (§6), and the Registrar endpoints (§8.3–§8.5) — are rooted at `https://webmail.{domain}`. No other subdomain (e.g. `mail.`, `api.`, `m.`, or the apex) is permitted for any endpoint defined by this protocol.
 - **Server** — A physical deployment of the Webmail backend (process + database). A Server hosts one or more Domains; each Domain hosted on the same Server has its own DNS domain, peer descriptor, and signing keypair, and is indistinguishable from a single-Domain Server to its peers. "Server" is an operational term and does not appear on the wire.
 - **Local recipient** — An account whose address ends in the Domain's own DNS domain.
 - **Remote recipient** — An account whose address ends in any other DNS domain.
@@ -77,12 +79,16 @@ Step 1 is cacheable. Step 2 is the normative transfer event. All message data �
 Each Domain **MUST** publish a peer descriptor at:
 
 ```
-https://{domain}/.well-known/webmail-federation
+https://webmail.{domain}/.well-known/webmail-federation
 ```
 
-over HTTPS with a valid certificate chain for `{domain}`. The endpoint **MUST** respond with `Content-Type: application/json` and **MUST NOT** require authentication.
+and **MUST NOT** publish it at any other hostname. In particular, the apex (`https://{domain}/...`) and any non-`webmail` subdomain (e.g. `mail.`, `api.`, `m.`) are not acceptable locations for the peer descriptor. Peers **MUST NOT** probe, accept, or cache descriptors served from any hostname other than `webmail.{domain}`.
 
-A Server hosting multiple Domains **MUST** serve a distinct peer descriptor at each Domain's DNS domain; descriptors **MUST NOT** be shared across DNS domains. In particular, each co-hosted Domain **MUST** carry its own `public_key`, because peers pin keys per DNS domain (§4.3) and a compromise of one Domain's key must not enable impersonation of another.
+The endpoint **MUST** be served over HTTPS (TLS 1.2 or later; see §9.1). The presented X.509 certificate **MUST** be valid for the hostname `webmail.{domain}` and **MUST** chain to a certificate authority trusted by the fetching peer under the Web PKI. Domain-validated (DV) certificates are the minimum acceptable validation level; Organization-Validated (OV) and Extended-Validation (EV) certificates satisfy this requirement. Self-signed certificates, certificates issued by a private CA not in the peer's Web PKI trust store, and IP-address certificates **MUST** be rejected. Plaintext HTTP **MUST NOT** be used, including for redirects that originate on `http://webmail.{domain}/...`; a peer encountering such a redirect **MUST** abort the fetch.
+
+The endpoint **MUST** respond with `Content-Type: application/json` and **MUST NOT** require authentication.
+
+A Server hosting multiple Domains **MUST** serve a distinct peer descriptor at each Domain's Federation hostname (`webmail.{domain}`); descriptors **MUST NOT** be shared across DNS domains. In particular, each co-hosted Domain **MUST** carry its own `public_key`, because peers pin keys per DNS domain (§4.3) and a compromise of one Domain's key must not enable impersonation of another. Each Domain's X.509 certificate **MUST** be valid for its own Federation hostname; wildcard certificates covering `*.{parent-zone}` are acceptable only to the extent that they are valid for `webmail.{domain}`.
 
 ### 4.2 Peer descriptor
 
@@ -91,21 +97,23 @@ The descriptor is a JSON object with the following members:
 | Field         | Type    | Required | Description                                                     |
 |---------------|---------|----------|-----------------------------------------------------------------|
 | `domain`      | string  | yes      | The DNS domain the Domain is authoritative for.                 |
-| `backend`     | string  | yes      | Absolute base URL of the Domain's API.                          |
-| `inbound`     | string  | yes      | Absolute URL of the inbound envelope endpoint (see §6).         |
+| `backend`     | string  | yes      | Absolute base URL of the Domain's API. **MUST** equal `https://webmail.{domain}`. |
+| `inbound`     | string  | yes      | Absolute URL of the inbound envelope endpoint (see §6). **MUST** be rooted at `https://webmail.{domain}`. |
 | `public_key`  | string  | yes      | Ed25519 public key for transport signing, as `ed25519:{base64}`.|
 | `versions`    | array   | yes      | List of protocol versions the Domain understands, e.g. `["0.1"]`. |
 | `registrar`   | boolean | no       | `true` if the Domain is a Registrar. Defaults to `false`. Governs §8 behavior. |
 | `max_envelope_bytes` | integer | no | Advertised upper bound on inbound envelope body size.           |
 | `max_attachment_bytes` | integer | no | Advertised upper bound on a single attachment payload.        |
 
+A peer **MUST** reject a descriptor whose `backend` or `inbound` URL is not rooted at `https://webmail.{descriptor.domain}`.
+
 Example:
 
 ```json
 {
   "domain": "example.com",
-  "backend": "https://api.example.com",
-  "inbound": "https://api.example.com/api/v1/federation/inbound",
+  "backend": "https://webmail.example.com",
+  "inbound": "https://webmail.example.com/api/v1/federation/inbound",
   "public_key": "ed25519:MCowBQYDK2VwAyEA...",
   "versions": ["0.1"],
   "registrar": false,
@@ -286,10 +294,10 @@ An Origin that is itself a Registrar **MAY** resolve external-address recipients
 
 ### 8.3 Registrar lookup
 
-A Registrar **MUST** expose:
+A Registrar **MUST** expose, at its Federation hostname:
 
 ```
-GET {backend}/api/v1/registrar/lookup?hash={sha256_hex(lowercase(address))}
+GET https://webmail.{domain}/api/v1/registrar/lookup?hash={sha256_hex(lowercase(address))}
 ```
 
 The `hash` query parameter is the hexadecimal SHA-256 digest of the lowercased external address being resolved. The request carries no body and requires no authentication.
@@ -309,10 +317,10 @@ Rules:
 
 ### 8.4 Pending-shadow query
 
-A Registrar **MUST** expose:
+A Registrar **MUST** expose, at its Federation hostname:
 
 ```
-GET {backend}/api/v1/registrar/pending-shadows?hash={sha256_hex(lowercase(address))}
+GET https://webmail.{domain}/api/v1/registrar/pending-shadows?hash={sha256_hex(lowercase(address))}
 X-Federation-Sender:    {peer_registrar_domain}
 X-Federation-Nonce:     {unique per request}
 X-Federation-Signature: ed25519:{base64(signature)}
@@ -340,10 +348,10 @@ A "pending record" in this document denotes a Registrar-internal state holding m
 
 ### 8.5 Claim by real email
 
-A Registrar **MUST** accept:
+A Registrar **MUST** accept, at its Federation hostname:
 
 ```
-POST {backend}/api/v1/federation/claim-by-real-email
+POST https://webmail.{domain}/api/v1/federation/claim-by-real-email
 Content-Type: application/json; charset=utf-8
 X-Federation-Version:   0.1
 X-Federation-Sender:    {origin_domain}
@@ -397,7 +405,9 @@ Re-dispatch by a Registrar (§8.5) is a new inbound transfer in its own right; t
 
 ### 9.1 Transport
 
-All requests defined in this document **MUST** be served over TLS 1.2 or later with certificates valid for the domain being addressed. Plaintext HTTP **MUST NOT** be used, including for the well-known endpoint.
+All requests defined in this document — well-known (§4.1), inbound transfer (§6), and Registrar endpoints (§8.3–§8.5) — **MUST** be served exclusively over HTTPS at the Federation hostname `webmail.{domain}`. TLS 1.2 or later **MUST** be negotiated; TLS versions below 1.2 **MUST** be rejected. The presented X.509 certificate **MUST** be valid for the hostname `webmail.{domain}` and **MUST** chain to a CA trusted by the fetching peer under the Web PKI. Domain-validated (DV) certificates are the minimum acceptable validation level; self-signed certificates, private-CA certificates not in the Web PKI, and certificates whose Subject Alternative Names do not cover `webmail.{domain}` **MUST** be rejected. Plaintext HTTP **MUST NOT** be used for any endpoint defined by this document, including redirect targets; a peer encountering an `http://` URL in a descriptor, in configuration, or as a redirect destination **MUST** abort the request.
+
+A peer **MUST NOT** accept or generate protocol URLs rooted at any hostname other than `webmail.{domain}`. Configuration that specifies alternative hostnames (`mail.{domain}`, `api.{domain}`, the apex, IP addresses, or `.onion` / `.local` hosts) is not compliant with this protocol and **MUST** be rejected at configuration load time by a compliant implementation.
 
 ### 9.2 Authentication scope
 
@@ -423,7 +433,18 @@ A Registrar configured as a peer can influence the routing of external-address e
 
 This document does not specify anti-abuse rules. A Destination Domain **SHOULD** apply per-peer rate limits, per-peer daily quotas, and content-based filters before accepting envelopes for delivery, and **MAY** refuse traffic from peers at its discretion using `403 Forbidden`. Registrars **SHOULD** additionally rate-limit `/registrar/lookup` per source IP or per sender domain to mitigate enumeration of their internal mapping.
 
-### 9.8 Privacy
+### 9.8 Federation hostname and DNS trust
+
+Locating the peer descriptor at `webmail.{domain}` rather than at the apex is consistent with RFC 8615 §3, which delegates the hostname choice for a well-known URI to the application-layer specification. This document is that specification and fixes the hostname to `webmail.{domain}`.
+
+The choice carries an implicit trust assumption that operators and peers **MUST** understand. A descriptor published at `webmail.example.com` claims authority over mailboxes at `example.com` — a parent DNS label. RFC 8615 §4.3 cautions against assuming that policy published at one host applies to a different host; here, that assumption is deliberate and load-bearing. The trust root is DNS: whoever controls the `example.com` zone controls both the `webmail` label and the authoritative nameservers, and can therefore both publish the descriptor and direct address-level delivery. This is the same trust root that SMTP and MX records rely on, and no stronger trust anchor is assumed.
+
+Two consequences follow:
+
+- A peer **MUST NOT** accept a descriptor for DNS domain `D` unless it was fetched from `https://webmail.D/.well-known/webmail-federation` over a TLS connection whose certificate is valid for `webmail.D` under the Web PKI (§4.1, §9.1). Fetching from any other host — including a sibling subdomain, a redirect target, or a CNAME flattening to a third-party host — does not establish authority over `D`.
+- An operator who publishes `webmail.{domain}` but does not intend it to speak for the apex DNS domain **MUST NOT** deploy this protocol on that hostname. There is no "scoped" or "non-authoritative" mode; publication at `webmail.{domain}` is itself the authority claim.
+
+### 9.9 Privacy
 
 The peer descriptor (§4.2) is public. Domains **MUST NOT** include user data, account counts, or internal topology in it.
 
@@ -443,7 +464,7 @@ This document requests no IANA actions. The well-known path `/.well-known/webmai
 - RFC 8174 — Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words.
 - RFC 3339 — Date and Time on the Internet: Timestamps.
 - RFC 8032 — Edwards-Curve Digital Signature Algorithm (EdDSA).
-- RFC 8615 — Well-Known Uniform Resource Identifiers.
+- RFC 8615 — Well-Known Uniform Resource Identifiers. §3 (hostname scope delegated to the application) and §4.3 (cross-host policy caveat) are cited in §9.8.
 - RFC 9562 — Universally Unique IDentifiers (UUIDs), including UUIDv7.
 
 ## Appendix A. Example exchange
@@ -452,10 +473,10 @@ This document requests no IANA actions. The well-known path `/.well-known/webmai
 
 Alice at `103mail.com` composes a message to `bob@example.com` and `carol@example.com`.
 
-The Origin Domain splits fan-out by domain and, for `example.com`, fetches (or reuses cached) `https://example.com/.well-known/webmail-federation`, then issues:
+The Origin Domain splits fan-out by domain and, for `example.com`, fetches (or reuses cached) `https://webmail.example.com/.well-known/webmail-federation`, then issues:
 
 ```
-POST https://api.example.com/api/v1/federation/inbound
+POST https://webmail.example.com/api/v1/federation/inbound
 Content-Type: application/json; charset=utf-8
 X-Federation-Version:   0.1
 X-Federation-Sender:    103mail.com
@@ -494,7 +515,7 @@ Content-Type: application/json
 {"envelope_id": "018f4d2b-...-7ac1", "status": "accepted"}
 ```
 
-The Destination then writes `g_thread`, `g_message`, and two per-recipient `thread` / `message` rows (onboarding Bob and/or Carol if needed) and emits a `sent_email` notification to each, linking back to `https://mail.example.com`.
+The Destination then writes `g_thread`, `g_message`, and two per-recipient `thread` / `message` rows (onboarding Bob and/or Carol if needed) and emits a `sent_email` notification to each, linking back to `https://webmail.example.com`.
 
 ### A.3 Reply
 
