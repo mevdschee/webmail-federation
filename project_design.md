@@ -22,6 +22,43 @@ React 19 + MUI, currently mock-only. `103mail.com` is hardcoded in `AuthFlow.tsx
 
 ## Design: shared client across federated domains
 
+### 0. The four levels: Server, Customer, Domain, User
+
+Before the topology, a word on the entities that structure everything below. The existing webmail schema is multi-tenant (see /home/maurits/projects/webmail/specs/001-internal-messaging/data-model.md), so federation inherits four levels, not three:
+
+```
+Server      physical deployment — process + database
+  └── Customer    tenant / billing / admin boundary — internal only
+        └── Domain      DNS domain — federation participant on the wire
+              └── User        mailbox holder — identified by sender_email
+```
+
+What each level is:
+
+- **Server** — a running PHP process with a database. An operator may run one or many. Purely an operational concept; never on the wire.
+- **Customer** — the `customer` row in the existing schema (`customer(id, name, default_mailbox_id)`). The unit of billing, administration, and data-isolation. `customer_id` scopes almost every per-tenant table (`user`, `mailbox`, `folder`, `alias`, `thread`, `message`, `attachment`, `contact`, `token`, `sent_email`, `domain`, `audit_log`). Admins are admins-of-a-Customer, not admins-of-a-Server. Also internal: the RFC never transmits it.
+- **Domain** — the `domain` row (`domain(id, name, customer_id)`). Owned by exactly one Customer. This is the federation participant: it has a DNS name, a Federation hostname (`webmail.{domain}`), a peer descriptor, and its own Ed25519 keypair. Peers see Domains and nothing else.
+- **User** — the `user` row (`user(id, customer_id, ...)`). Belongs to exactly one Customer, which means a User's mailbox lives inside that Customer's tenancy. A User's addresses (via `alias`) may be in any Domain owned by their Customer.
+
+**Cardinalities:**
+
+- one Server → N Customers
+- one Customer → N Domains (a single Customer may own `acme-eu.com`, `acme-us.com`, `acme.io` together)
+- one Customer → N Users (the Users inside that Customer)
+- one Domain → N Users indirectly, via the aliases held in that Domain by Users of the Domain's owning Customer
+- one User → N Aliases, which may span Domains within the User's Customer
+
+**The wire invariant: Domains look independent; Customer is hidden.** Two Domains owned by the same Customer on the same Server federate as if they were two strangers: separate descriptors, separate keypairs, separate envelopes. A peer cannot tell that `acme-eu.com` and `acme-us.com` are co-owned, and the protocol does not let us tell them. Internally the Server may short-circuit delivery between them (§13.6) and share user accounts across them (§13.4), but none of that is observable from outside.
+
+Why keep Customer rather than collapse it into Domain? Because the jobs are different:
+
+- Customer is the billing/admin/isolation unit. It outlives the specific DNS domains it happens to own; a customer can add `acme.io` next year and keep the same user accounts.
+- Domain is the federation identity. It is fixed to one DNS name and one keypair.
+
+Forcing Customer = Domain (i.e. three levels) would mean either "one customer per DNS domain" (breaks the Acme-with-three-domains case and forces duplicate user accounts) or "one DNS domain per customer" (forbids multi-domain tenants). Neither is what the existing schema supports, and neither matches how B2B mail tenancy actually works.
+
+The rest of this document references these four levels by name. Where something is "per-Customer" or "per-Domain", the distinction matters.
+
 ### 1. Deployment topology
 
 ```
@@ -69,7 +106,8 @@ Single bundle, per-domain runtime config resolved from the hostname:
   domain.is_local         BOOLEAN   -- this Server hosts the domain
   domain.last_seen_at     DATETIME  -- discovery cache timestamp
   ```
-- Retire the "one row where customer_id IS NULL" convention; every hosted Domain's `domain` row is marked `is_local = true`, other domains are populated lazily via discovery.
+  `domain.customer_id` stays as-is: every Domain — local or remote — has an owning Customer. For locally-hosted Domains that Customer is the tenant whose users actually live there (§0); for remote Domains populated via discovery, the row is synthesized with a `customer_id` that represents "this Server's view of that remote tenant" (a placeholder Customer row is fine) so that the NOT-NULL constraint and the existing `customer_id` scoping continue to hold uniformly.
+- Retire the "one row where customer_id IS NULL" convention; every hosted Domain's `domain` row is marked `is_local = true` with the owning Customer's `customer_id`, and other domains are populated lazily via discovery.
 
 ### 4. Fan-out split: local vs remote recipients
 
@@ -319,23 +357,35 @@ The federated identifiers `T`, `M1`, `M2` are identical across both databases; t
 
 ### 13. Multi-Domain Servers
 
-Nothing in the wire protocol requires that one DNS domain equal one Server. A single Server **MAY** host several Domains at once (e.g. one operator runs `103mail.com`, `example.com`, and `acme.io` on the same process and database). Each Domain remains an independent federation participant on the wire — the RFC doesn't know, and its peers can't tell, that they share a process. A single-Domain Server is this same setup with `local_domains` holding one entry, so the multi-Domain machinery below is not a separate mode but the general case.
+Nothing in the wire protocol requires that one DNS domain equal one Server. A single Server **MAY** host several Domains at once, either because one Customer owns several DNS domains (e.g. `Acme Corp` owning `acme-eu.com`, `acme-us.com`, `acme.io`) or because the Server is multi-Customer (e.g. one operator runs `103mail.com` for Customer A and `example.com` for Customer B on the same process and database). The four-level hierarchy from §0 cleanly covers both cases: `Customer → Domain` is a one-to-many relation, and a Server may host any number of Customers.
+
+Each Domain remains an independent federation participant on the wire — the RFC doesn't know, and its peers can't tell, that two Domains share a process or that they share a Customer. A single-Customer/single-Domain Server is this same setup with one `customer` row and `local_domains` holding one entry, so the multi-Domain machinery below is not a separate mode but the general case.
 
 #### 13.1 What changes in Domain config
 
-`config/domain.php` (or the equivalent env-backed loader) returns a list of Domains this Server hosts:
+`config/domain.php` (or the equivalent env-backed loader) returns a list of Domains this Server hosts. Each entry names the DNS domain and the owning Customer:
 
 ```
 local_domains: [
   {
-    "domain":          "103mail.com",
-    "brand":           { "name": "103mail",  "logo": "/103mail.svg",
-                         "marketing_url": "https://103mail.com" },
+    "domain":          "acme-eu.com",
+    "customer_id":     42,                              # Acme Corp
+    "brand":           { "name": "Acme (EU)",  "logo": "/acme-eu.svg",
+                         "marketing_url": "https://acme.com" },
+    "federation_private_key": "ed25519:...",
+    "federation_public_key":  "ed25519:...",
+  },
+  {
+    "domain":          "acme-us.com",
+    "customer_id":     42,                              # same Customer
+    "brand":           { "name": "Acme (US)",  "logo": "/acme-us.svg",
+                         "marketing_url": "https://acme.com" },
     "federation_private_key": "ed25519:...",
     "federation_public_key":  "ed25519:...",
   },
   {
     "domain":          "example.com",
+    "customer_id":     99,                              # different Customer
     "brand":           { "name": "Example Mail", "logo": "/example.svg",
                          "marketing_url": "https://example.com" },
     "federation_private_key": "ed25519:...",
@@ -344,7 +394,9 @@ local_domains: [
 ]
 ```
 
-The Federation hostname `webmail.{domain}` is **derived**, not configured, from the `domain` field — `webmail.103mail.com`, `webmail.example.com`. The config loader rejects any attempt to override the hostname (e.g. a legacy `hostname: "mail.103mail.com"` field) so that a deploy cannot accidentally drift away from the RFC's single-hostname rule.
+`customer_id` ties the Domain to its owning Customer (matching `domain.customer_id` in the DB). The first two entries share a Customer and therefore share users, passwords, mailboxes, and admin scope (§13.4, §13.9). The third is a different Customer on the same Server, fully isolated at the `customer_id` boundary (§13.8).
+
+The Federation hostname `webmail.{domain}` is **derived**, not configured, from the `domain` field — `webmail.acme-eu.com`, `webmail.example.com`. The config loader rejects any attempt to override the hostname (e.g. a legacy `hostname: "mail.acme-eu.com"` field) so that a deploy cannot accidentally drift away from the RFC's single-hostname rule.
 
 Each Domain has its **own** federation keypair — never shared, because remote peers pin keys per DNS domain (§5). Compromise of one Domain's key must not let an attacker impersonate the others co-hosted on the same Server. Each Domain also **MUST** present an X.509 certificate valid for its own `webmail.{domain}` (DV minimum); a single wildcard certificate covering `webmail.*.{parent-zone}` is acceptable only if it is actually valid for every hosted Domain's Federation hostname.
 
@@ -369,11 +421,16 @@ The same Server serves:
 
 Selection is again `Host`-based on the `webmail.{d}` form. The apex (`https://103mail.com/...`) is not a protocol endpoint and **MUST NOT** serve the descriptor; operators may use it for a marketing page or may leave it without a webmail-federation route entirely. Peers never learn that these two Domains share a Server.
 
-#### 13.4 User and mailbox identity stays Domain-local
+#### 13.4 Customer, User, and Domain ownership
 
-- A `customer` and a `user` row belong to exactly one Domain. The association is recorded as `user.domain_id` (new column) — there is no "customer that spans Domains". A person who wants accounts on both `103mail.com` and `example.com` has two `user` rows and two `customer` rows, even if both Domains are co-hosted on the same Server.
-- Aliases are already keyed by unique `email`; `alice@103mail.com` and `alice@example.com` coexist without schema change.
-- Login is scoped by the active Domain: the same local-part (`alice`) can log into `webmail.103mail.com` and `webmail.example.com` and reach different mailboxes. Bearer tokens are issued with the DNS domain embedded, and rejected if used against a different Domain.
+The four-level hierarchy (§0) drives the rules here — specifically, that Customer sits between Server and Domain, and that Users belong to Customers, not to Domains directly.
+
+- **Customer ownership of Domains.** `domain.customer_id` is already in the schema. A Customer may own one Domain (`Beta Inc` owning just `beta.io`) or several (`Acme Corp` owning `acme-eu.com`, `acme-us.com`, `acme.io`). All Domains a Customer owns **MUST** be hosted on the same Server — ownership is resolved through one `customer` row and therefore one database. Co-hosted Domains with different owners are a separate case (§13.9: one Server, N Customers).
+- **User belongs to Customer, not to Domain.** `user.customer_id` is existing; there is no `user.domain_id` column and this design does not add one. A User's reachable identities are the `alias` rows attached to their mailbox, each of which carries an `email` whose domain part is one of the Customer's Domains. Alice at Acme may have `alice@acme-eu.com` and `alice@acme-us.com` as aliases on the same mailbox; both are valid, both deliver to the same inbox.
+- **Cross-Domain single sign-on is allowed within a Customer.** Since a User has one account and one password inside their Customer, they can log in at any Federation hostname whose Domain their Customer owns. `alice` authenticates at `webmail.acme-eu.com` and at `webmail.acme-us.com` and reaches the same mailbox. No cross-Customer SSO: if `alice@acme-eu.com` and `alice@beta.io` are different Customers, they are different accounts and different passwords even if the same person holds both.
+- **Aliases are keyed by unique `email`.** `alice@103mail.com` and `alice@example.com` coexist without schema change. Two different Customers cannot both own an alias for the same `email` (the uniqueness constraint prevents it); this is how address ownership stays single-sourced even on a shared Server.
+- **Tokens are Domain-scoped on the wire, Customer-scoped internally.** Bearer tokens are issued by the backend for a specific (Customer, User) pair, and carry the DNS domain the token was minted for in their claims. A token minted at `webmail.acme-eu.com` is accepted at `webmail.acme-us.com` **only if** both Domains share a Customer — the backend checks `domain.customer_id` equality before honoring cross-Domain use. A token **MUST NEVER** be honored across Customer boundaries.
+- **Federation identity is per-Domain, always.** On the wire, Alice's mail from `alice@acme-eu.com` is signed by the `acme-eu.com` keypair, and mail from `alice@acme-us.com` is signed by the `acme-us.com` keypair. Peers see two independent Domains. The Customer linking them is invisible — peers cannot tell that these two `alice`s are the same person, nor that the Domains are co-owned.
 
 #### 13.5 Auto-onboarding uses the recipient's domain, not a global default
 
@@ -384,10 +441,16 @@ email       = "foo@example.com"
 domain      = "example.com"
 # Is this domain hosted here?
 if domain in local_domains:
+    # Resolve the owning Customer of this Domain; auto-onboarding
+    # creates a user inside that Customer (user.customer_id = owning customer).
+    owning_customer = local_domains[domain].customer_id
     alias_local_part = random_int(1000000, 9999999)
     alias            = f"{alias_local_part}@{domain}"
-    create customer + user + mailbox + folder + alias
-    # user.domain_id = id of example.com row
+    create user(customer_id = owning_customer)
+         + mailbox(customer_id = owning_customer)
+         + folder(customer_id = owning_customer)
+         + alias(customer_id = owning_customer, email = alias)
+    # If the Customer does not yet exist (brand-new tenant), create it first.
 else:
     # Not local — federation branch (§4), no onboarding.
 ```
@@ -398,7 +461,9 @@ The random-local-part trick for privacy is preserved; only the domain suffix is 
 
 When Alice at `103mail.com` sends to Bob at `example.com` **and both Domains are co-hosted on the same Server**, the fan-out loop in §4 takes the local branch for both recipients. No envelope is built, no HTTP is emitted, no signature is computed, no `federation_delivery` row is written. The exchange is a pure in-process database operation — exactly as it would be for two users on the same DNS domain.
 
-That property follows from the fan-out rule in §4 unchanged: membership in `local_domains` is the only test. A future operator who splits `example.com` onto its own separate Server flips one row (`domain.is_local = false`, `domain.backend_url = "https://webmail.example.com"`), and from that point the same send automatically uses federation instead. The sending code path is identical either way; only the branch taken at dispatch time differs.
+This short-circuit is based on Server co-location (membership in `local_domains`), not Customer co-ownership. Two Domains owned by the **same Customer** short-circuit trivially — they share `customer_id` and Alice's and Bob's mailboxes sit in the same tenant rows. Two Domains owned by **different Customers** on the same Server also short-circuit, but the write crosses `customer_id`: Alice is in Customer A's rows, Bob is in Customer B's rows, and the per-recipient insert into Bob's `thread` / `message` has to happen under B's tenancy. That is permitted — it is the same operation that happens today when Acme's user messages Beta's user on a shared backend — but it is the one place where the `customer_id` boundary is crossed by a write. Customer-level data isolation (§0) still holds for reads: Alice cannot see Bob's folder tree, Bob cannot see Alice's Sent.
+
+That property follows from the fan-out rule in §4 unchanged: membership in `local_domains` is the only test. A future operator who splits `example.com` onto its own separate Server flips one row (`domain.is_local = false`, `domain.backend_url = "https://webmail.example.com"`), and from that point the same send automatically uses federation instead. The sending code path is identical either way; only the branch taken at dispatch time differs — and the Customer layer is invisible to peers regardless of which side of the branch is taken.
 
 #### 13.7 Notifications pick the right branded host
 
@@ -406,18 +471,34 @@ The `sent_email` template's base URL now resolves from the **recipient's** Domai
 
 #### 13.8 What is not shared across co-hosted Domains
 
+Regardless of whether the Domains share a Customer:
+
 - **Keys** — separate Ed25519 keypair per Domain (§13.1).
 - **Brand assets** — separate logo, marketing URL, display name (§2, §13.1).
-- **User accounts** — no cross-Domain single sign-on (§13.4).
-- **Tokens** — issued against one Domain, rejected against others.
+- **Federation identity on the wire** — separate peer descriptor, separate `origin_domain`, separate signatures (§5).
+
+Across Domains of **different Customers**, additionally:
+
+- **User accounts** — a User of Customer A cannot log into any Domain of Customer B; `customer_id` gates authentication.
+- **Tokens** — a token minted for Customer A is rejected against any Domain whose `customer_id` is not A.
+- **Mailboxes, folders, aliases, contacts** — every per-tenant table is scoped by `customer_id`; cross-Customer reads are forbidden.
 
 #### 13.9 What is shared across co-hosted Domains
 
-- **The codebase and the running process** — one PHP Server handles N Domains.
-- **The database schema and, optionally, the physical database** — `domain`, `customer`, `user`, `alias`, etc. are reused; rows are scoped by `domain_id` / `customer_id`. Operators who want stricter blast-radius isolation can still deploy one database per Domain without any code change; the domain loader just points each `Host` at a different DSN.
-- **The outbound federation worker and the inbound federation endpoint** — they simply loop over `local_domains` when signing outbound envelopes (using each envelope's `origin_domain` to pick the right key) and accept inbound traffic for any hosted Domain.
+Regardless of Customer ownership:
 
-The federation protocol does not change. The operator gains a deployment choice: N Domains on one Server for low-volume / small operators, or one Domain per Server for isolation, performance, or compliance — with the same code, same schema, same wire format.
+- **The codebase and the running process** — one PHP Server handles N Customers × M Domains.
+- **The database schema and, optionally, the physical database** — `customer`, `domain`, `user`, `alias`, etc. are reused; rows are scoped by `customer_id` / `domain_id`. Operators who want stricter blast-radius isolation can still deploy one database per Customer (or per Domain) without any code change; the domain loader just points each `Host` at a different DSN.
+- **The outbound federation worker and the inbound federation endpoint** — they loop over `local_domains` when signing outbound envelopes (using each envelope's `origin_domain` to pick the right key) and accept inbound traffic for any hosted Domain.
+
+Across Domains of **the same Customer**, additionally:
+
+- **User accounts and passwords** — one `user` row serves all of the Customer's Domains; a single login works at every `webmail.{domain}` whose Domain the Customer owns (§13.4).
+- **Mailboxes** — a User's single mailbox receives mail addressed to any of the User's aliases, across Domains of the User's Customer.
+- **Tokens within the Customer** — a token can be accepted at any Domain owned by its Customer (§13.4); `customer_id` equality is the check.
+- **Admin scope** — a Customer admin administers all of that Customer's Domains at once.
+
+The federation protocol does not change. The operator gains two orthogonal deployment choices: (1) how many Customers per Server, and (2) how many Domains per Customer. A single-Customer/single-Domain Server is the minimal case; all four combinations are supported with the same code, same schema, and the same wire format — and peers cannot tell them apart.
 
 ### 14. Shadow mailboxes for unreachable domains
 

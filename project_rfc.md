@@ -23,7 +23,20 @@ The following terms are used throughout:
 - **Domain** — The logical Webmail-Federation participant. A Domain is authoritative for exactly one DNS domain and for the mailboxes local to it. All protocol rules in this document apply per-Domain.
 - **DNS domain** — The bare internet domain a Domain is authoritative for (e.g. `example.com`). Distinct from the **Federation hostname** (below), which is where the Domain's endpoints are served.
 - **Federation hostname** — The fixed hostname `webmail.{domain}` under which every endpoint defined by this document is served. All protocol URLs — the well-known endpoint (§4.1), the inbound endpoint (§6), and the Registrar endpoints (§8.3–§8.5) — are rooted at `https://webmail.{domain}`. No other subdomain (e.g. `mail.`, `api.`, `m.`, or the apex) is permitted for any endpoint defined by this protocol.
-- **Server** — A physical deployment of the Webmail backend (process + database). A Server hosts one or more Domains; each Domain hosted on the same Server has its own DNS domain, peer descriptor, and signing keypair, and is indistinguishable from a single-Domain Server to its peers. "Server" is an operational term and does not appear on the wire.
+- **Customer** — A Server-internal tenant entity that owns one or more Domains and the Users within them, and serves as the billing, administrative, and data-isolation boundary. The Customer is an implementation concept only: it is not transmitted in any envelope, header, or peer descriptor, and peers **MUST NOT** be given any way to infer whether two Domains share a Customer. Two Domains owned by the same Customer are, on the wire, indistinguishable from two Domains owned by different Customers — in both cases each Domain is an independent federation participant with its own DNS domain, peer descriptor, and signing keypair.
+- **User** — An individual account within a Customer. A User belongs to exactly one Customer and may hold addresses (aliases) in any Domain owned by that Customer. On the wire, a User is identified only by the `sender_email` on outbound envelopes (§5.2); the User's Customer is never exposed.
+- **Server** — A physical deployment of the Webmail backend (process + database). A Server hosts one or more Customers; each Customer owns one or more Domains; each Domain hosted on the Server has its own DNS domain, peer descriptor, and signing keypair, and is indistinguishable from a single-Domain Server to its peers. "Server" and "Customer" are operational terms and do not appear on the wire.
+
+The four levels — Server, Customer, Domain, User — form a strict hierarchy:
+
+```
+Server    (physical deployment; process + database)
+  └── Customer  (tenant / billing / admin boundary; internal only)
+        └── Domain    (DNS domain; federation participant on the wire)
+              └── User      (mailbox holder; identified by sender_email)
+```
+
+Only the Domain and User levels are observable on the wire; Server and Customer are implementation details of a given deployment and are not negotiated, advertised, or transmitted by this protocol.
 - **Local recipient** — An account whose address ends in the Domain's own DNS domain.
 - **Remote recipient** — An account whose address ends in any other DNS domain.
 - **Origin Domain** — The Domain whose user composes a new message.
@@ -412,6 +425,8 @@ A peer **MUST NOT** accept or generate protocol URLs rooted at any hostname othe
 ### 9.2 Authentication scope
 
 Signatures in Webmail-Federation authenticate **the Domain**, not the end user. A recipient **MUST NOT** infer from a valid envelope signature that the message content was authored by the claimed `sender_email`; they can only infer that the `origin_domain` Domain asserts so. End-user authentication is out of scope.
+
+The Customer layer (§1) is not authenticated and is not visible on the wire. A peer **MUST NOT** act on any claim about Customer membership, because no such claim is carried by this protocol; the on-wire identity of a sender is the Domain only. Implementations **MUST NOT** add headers, envelope fields, or descriptor fields that disclose Customer identity, Customer membership across Domains, or the number of Domains a Customer owns; such disclosures would leak Server-internal tenancy to peers without security benefit.
 
 ### 9.3 Replay and clock skew
 
