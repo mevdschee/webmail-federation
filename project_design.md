@@ -115,7 +115,7 @@ Single bundle, per-domain runtime config resolved from the hostname:
 
 - **Async at the user boundary.** No compose, no reply, no claim-accept ever blocks on a remote peer's response. The flow is: (1) write local `g_*` and per-user rows, (2) return success to the user, (3) enqueue the outbound call, (4) a background worker actually makes the network attempt. Alice's browser sees `201 Created` from her own Server before any packet goes to a peer. The only thing that can make a user-visible operation fail is a local error (validation, DB write, auth) — never a peer being down.
 - **At-least-once delivery + idempotent receivers.** Every outbound mutating call carries a UUIDv7 identifier chosen before the first attempt and reused on retry. Receivers dedupe on `(origin_domain, envelope_id)` for inbound envelopes, `(origin_domain, offer_id)` for shadow-offers, `(origin_domain, claim_id)` for claims. A duplicate produces the original `2xx` response with no re-application of side effects.
-- **Queued + retried.** Every outbound call has a row in the single `federation_outbox` table (schema and rules below) with `kind`, `status`, `attempts`, `last_error`, `next_retry_at`. Envelopes, shadow-offers, claims, backfills, and `claim-by-real-email` posts all share the same queue and the same worker — `kind` discriminates the payload, not the delivery machinery. Retry is exponential with full jitter, 30s → 1h, 48h budget (matching RFC §6.4). Workers are idempotent — crashing mid-send and re-running from the queue produces the same outcome, not a duplicate.
+- **Queued + retried.** Every outbound call has a row in the single `federation_outbox` table (schema and rules below) with `kind`, `status`, `attempts`, `last_error`, `next_retry_at`. Envelopes, shadow-offers, claims, backfills, and `claim-by-real-email` posts all share the same queue and the same worker — `kind` discriminates the payload, not the delivery machinery. Retry is exponential with full jitter, 30s → 1h, 72h budget (matching RFC §6.4). Workers are idempotent — crashing mid-send and re-running from the queue produces the same outcome, not a duplicate.
 - **Bounded timeouts.** Every HTTP call sets a connect timeout (~5s) and a read timeout (~30s for envelopes, ~2s for registrar lookups, ~10s for well-known fetches). "Stuck" never means "waits forever" — it means "waits the budget and then fails transient." This applies especially to registrar `/lookup` (§16.3), which sits in the compose path: a 2s cap with fall-through to local auto-onboarding keeps user-visible latency predictable regardless of peer health.
 - **Permanent failure has a user-visible consequence.** Exhausting the retry budget or receiving a terminal 4xx **always** produces a local bounce in the sender's mailbox (§7 notifications), never a silent drop. "Delivered" in the sender's Sent folder means "durably enqueued locally," not "accepted by the remote peer" — but if the remote peer permanently refuses, the sender is told. Alice never has to discover a lost message by asking Bob.
 - **Fan-out is per-destination independent.** Alice sending to five external Domains produces five independent `federation_outbox` rows. One peer being slow or down has zero effect on the other four. There is no "all-or-nothing" batch; there is no global lock; there is no cross-peer ordering constraint.
@@ -176,13 +176,18 @@ Rules of this table:
 - **Write-before-send.** The row is inserted in the same DB transaction that writes the user-facing `g_*` rows or §14 / §15 state change. No row, no send attempt. This is what makes the write-locally-then-return-success flow durable: a worker crash after commit still re-sends the request on restart.
 - **Body is bytes, not a recipe.** The HTTP body is stored exactly as signed. On retry the worker re-uses the stored `body` and `headers` verbatim — never re-serialized, never re-signed. Anything else races the signature against JSON key ordering and clock-skew in nonce reuse. Corollary: the stored `body` is immutable; schema migrations to envelope shape do not rewrite old rows, they only affect new sends.
 - **Single worker, but parallel per-peer.** One worker process (or pool) claims rows where `status = 'pending' AND next_retry_at <= NOW()`, flips them to `in_flight`, does the `curl`, writes back the result. The claim query partitions by `peer_domain` so one slow peer cannot starve sends to other peers (§4 preamble: no synchronous fan-out across peers). A per-peer concurrency cap plus the `peer_domain` index keeps one misbehaving peer from eating the worker pool.
-- **Retry schedule.** `next_retry_at = now + expbackoff(attempts, base=30s, cap=1h, jitter=full)`, ceiling 48h total budget (matching RFC §6.4). On `202` or `200`: `status = 'delivered'`, `delivered_at = NOW()`. On transient (5xx / 408 / 425 / 429 / connect timeout / read timeout / TLS error): `attempts++`, reschedule. On permanent 4xx or budget-exhausted: `status = 'permanent_failure'`, and the consequence is routed by `kind` — an envelope failure generates a local bounce in the sender's mailbox, an offer failure is silently retired, a claim failure is surfaced in the claiming user's UI.
+- **Retry schedule.** `next_retry_at = now + expbackoff(attempts, base=30s, cap=1h, jitter=full)`, ceiling 72h total budget (matching RFC §6.4). On `202` or `200`: `status = 'delivered'`, `delivered_at = NOW()`. On transient (5xx / 408 / 425 / 429 / connect timeout / read timeout / TLS error): `attempts++`, reschedule. On permanent 4xx or budget-exhausted: `status = 'permanent_failure'`, and the consequence is routed by `kind` — an envelope failure generates a local bounce in the sender's mailbox, an offer failure is silently retired, a claim failure is surfaced in the claiming user's UI.
 - **Idempotency key is the protocol identifier.** `envelope_id` for envelopes, `offer_id` for shadow-offers, `claim_id` for claims, and so on — all UUIDv7 generated at enqueue time, never at send time. The `UNIQUE(origin_domain, idempotency_key)` constraint makes double-enqueue a database error, not a duplicate send.
 - **Honors `Retry-After`.** If the peer returns `429` with a `retry_after_seconds` body field or a `Retry-After` header, `next_retry_at` is set no earlier than that time for that `peer_domain`. Applies to the whole peer, not just the row, so follow-up sends to that peer also back off.
 - **Observable as-is.** The table doubles as the operational queue and the forensic log. "What is this Server currently owing to that Server?" is a single `SELECT ... WHERE peer_domain = ? AND status IN ('pending', 'in_flight')`. Delivered rows may be pruned after N days; permanent_failure rows are kept for audit and are what `sent_email`-bounce templates reference.
 - **Nothing in the user-facing code path writes HTTP directly.** Callers stage `federation_outbox` rows and return; the worker owns every outbound `curl`. This is the concrete mechanism for "async at the user boundary" — there is no branch in request-handling code that waits on a peer.
 
-Inbound requests have no analogous table. A peer's envelope hits `/api/v1/federation/inbound`, is verified and written into `g_thread` / `g_message` / per-user rows in one transaction, and the peer gets `202` before the response returns. The idempotency key on the receiver side is the incoming `envelope_id` (or `offer_id` / `claim_id`), stored in a small `federation_inbox_seen(origin_domain, kind, idempotency_key, first_seen_at)` dedupe table so replays produce the original response without re-applying side effects. That table is tiny, TTL'd per RFC §9.3 nonce-window rules, and does not need the retry machinery above.
+Inbound requests have no analogous outbox table. A peer's envelope hits `/api/v1/federation/inbound`, is verified and written into `g_thread` / `g_message` / per-user rows in one transaction, and the peer gets `202` before the response returns. The receiver uses two small state tables:
+
+- `federation_nonce_seen(sender_domain, endpoint_kind, nonce, seen_at)` — short-lived, 10-minute TTL per RFC §9.4. Protects against replay within the signature-validity window.
+- `federation_inbox_seen(origin_domain, kind, idempotency_key, first_seen_at, response_status, response_body)` — longer-lived, 96-hour TTL per RFC §5.4. Lets replays of a successfully-processed envelope return the original `202` (or original terminal error) without re-applying side effects. Retention exceeds the RFC's 72-hour retry budget by a 24h safety margin.
+
+Neither table needs the retry machinery above.
 
 ### 5. Peer discovery + trust
 
@@ -190,12 +195,15 @@ Inbound requests have no analogous table. A peer's envelope hits `/api/v1/federa
   ```json
   {
     "domain": "example.com",
-    "backend": "https://webmail.example.com",
-    "inbound": "https://webmail.example.com/api/v1/federation/inbound",
-    "public_key": "ed25519:..."
+    "public_key": "ed25519:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
+    "previous_public_keys": [],
+    "versions": ["0.2"],
+    "registrar": false,
+    "max_envelope_bytes": 10485760,
+    "max_attachment_bytes": 26214400
   }
   ```
-  The descriptor's `backend` and `inbound` **MUST** be rooted at `https://webmail.{domain}`. A descriptor advertising any other hostname is rejected.
+  The descriptor carries no endpoint URLs at all — every path is fixed by the RFC (§4.2) and derived from `domain`. Inbound is always `https://webmail.{domain}/api/v1/federation/inbound`, the registrar endpoints are always `https://webmail.{domain}/api/v1/registrar/*`, etc. This removes an entire class of "peer advertised a weird URL" misconfigurations.
 - First time 103mail needs to talk to `example.com`: HTTP `GET https://webmail.example.com/.well-known/webmail-federation`, pin the pubkey into the `domain` row, cache for 24h. A 103mail peer **MUST NOT** probe the apex (`https://example.com/...`) or any alternative subdomain; discovery is a fixed-URL fetch, not a search.
 - The fetch is HTTPS-only and the certificate **MUST** be a Web-PKI certificate valid for `webmail.example.com` (DV minimum, §1). Self-signed, private-CA, and bare-hostname certificates are refused at the TLS layer before any descriptor bytes are read.
 - Web-PKI CA chain + TOFU pubkey pin: the CA check authenticates the hostname at first contact; the pinned Ed25519 key authenticates every subsequent envelope regardless of CA changes.
@@ -321,7 +329,7 @@ X-Federation-Signature: ed25519(body || "\n" || nonce)
 }
 ```
 
-On `202 Accepted`, `federation_outbox.status` flips to `delivered`. On transient failure (5xx, 429), the retry clock starts (30s → 1h with jitter, 48h budget). On permanent failure (4xx), a local bounce message is inserted into Alice's inbox.
+On `202 Accepted`, `federation_outbox.status` flips to `delivered`. On transient failure (5xx, 429), the retry clock starts (30s → 1h with jitter, 72h budget). On permanent failure (4xx), a local bounce message is inserted into Alice's inbox.
 
 **Step G — destination backend verifies and delivers.** The example.com backend:
 
